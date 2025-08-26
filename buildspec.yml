@@ -1,0 +1,52 @@
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.9  # or 3.8, 3.10, 3.11
+    commands:
+      - echo Installing pip and dependencies...
+      - python -m pip install --upgrade pip
+      - pip install -r requirements.txt
+  
+  pre_build:
+    commands:
+      - echo Pre-build phase started on `date`
+      - echo Running linting...
+      - flake8 . || true
+      - echo Running tests...
+      - python -m pytest tests/ --junitxml=test-results.xml || true
+  
+  build:
+    commands:
+      - echo Build started on `date`
+      - echo Building Python application...
+      - python setup.py build || echo "No setup.py found, skipping build"
+      - echo Creating distribution packages...
+      - python -m pip install --upgrade build
+      - python -m build || echo "Using existing files"
+  
+  post_build:
+    commands:
+      - echo Post-build phase started on `date`
+      - echo Build completed on `date`
+      - ls -la dist/ || echo "No dist directory found"
+
+artifacts:
+  files:
+    - '**/*'
+  exclude-paths:
+    - __pycache__/**/*
+    - '*.pyc'
+    - tests/**/*
+    - .pytest_cache/**/*
+  
+cache:
+  paths:
+    - ~/.cache/pip/**/*
+
+reports:
+  pytest_reports:
+    files:
+      - test-results.xml
+    base-directory: '.'
