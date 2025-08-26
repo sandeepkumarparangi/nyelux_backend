@@ -1,0 +1,21 @@
+# ===== UPDATED CONFIGURATION FOR AWS RDS + SUPABASE =====
+
+# Add these lines to your .env file:
+
+# ===== AWS RDS CONFIGURATION (Private Data) =====
+# Replace with your actual AWS RDS endpoint
+AWS_RDS_HOST=your-database.region.rds.amazonaws.com
+AWS_RDS_PORT=5432
+AWS_RDS_DB=nyelux_production
+AWS_RDS_USER=your_rds_username
+AWS_RDS_PASSWORD=your_rds_password
+
+# Update DATABASE_URL to point to AWS RDS instead of local
+DATABASE_URL=postgresql+asyncpg://${AWS_RDS_USER}:${AWS_RDS_PASSWORD}@${AWS_RDS_HOST}:${AWS_RDS_PORT}/${AWS_RDS_DB}
+SYNC_DATABASE_URL=postgresql://${AWS_RDS_USER}:${AWS_RDS_PASSWORD}@${AWS_RDS_HOST}:${AWS_RDS_PORT}/${AWS_RDS_DB}
+
+# ===== SUPABASE CONFIGURATION (Public GUDID Data) =====
+# Keep your existing Supabase config for GUDID data
+SUPABASE_URL=https://zjpdsedtsuypcovchyyj.supabase.co
+SUPABASE_ANON_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InpqcGRzZWR0c3V5cGNvdmNoeXlqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTQ2MjA4MDcsImV4cCI6MjA3MDE5NjgwN30.GILvrDvscZyaYBjwx384EJlZ5zisQvZxqmumO23OXNo
+SUPABASE_SERVICE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InpqcGRzZWR0c3V5cGNvdmNoeXlqIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1NDYyMDgwNywiZXhwIjoyMDcwMTk2ODA3fQ.qGkqWitjlLEONuh0nBqZVSKh3wn0Ij8YlTFmUTMDL-Y

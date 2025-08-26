@@ -1,0 +1,2890 @@
+"""
+Deployment & Operations Tests
+Test ID Range: TC-DEPLOY-001 to TC-DEPLOY-050
+Section 20: Deployment & Operations
+"""
+
+import pytest
+import asyncio
+import subprocess
+import psutil
+import json
+import time
+import os
+import tempfile
+import shutil
+from datetime import datetime, timedelta
+from typing import Dict, List, Any, Optional
+from unittest.mock import Mock, patch, AsyncMock
+import aiohttp
+import docker
+import kubernetes
+from prometheus_client.parser import text_string_to_metric_families
+import logging
+
+from httpx import AsyncClient
+from sqlalchemy.ext.asyncio import AsyncSession
+from redis import asyncio as aioredis
+import yaml
+import boto3
+from datadog import statsd
+from sentry_sdk import capture_exception
+
+from src.db.models import User, Organization, BackgroundJob, SystemHealth
+from src.services.deployment_service import DeploymentService
+from src.services.monitoring_service import MonitoringService
+from src.services.health_check_service import HealthCheckService
+from src.services.rollback_service import RollbackService
+from src.services.feature_flag_service import FeatureFlagService
+from src.core.config import settings
+from tests.factories import UserFactory, OrganizationFactory
+
+logger = logging.getLogger(__name__)
+
+
+class TestDeploymentStrategy:
+    """Test deployment strategies and zero-downtime deployments"""
+    
+    @pytest.mark.asyncio
+    async def test_blue_green_deployment_tc_deploy_001(
+        self,
+        client: AsyncClient,
+        db: AsyncSession,
+        deployment_service: DeploymentService
+    ):
+        """TC-DEPLOY-001: Test blue-green deployment strategy"""
+        # Setup
+        current_version = "v1.0.0"
+        new_version = "v1.1.0"
+        
+        # Create deployment configuration
+        deployment_config = {
+            "strategy": "blue-green",
+            "blue_environment": {
+                "version": current_version,
+                "instances": 4,
+                "health_check_url": "/health",
+                "load_balancer": "blue-lb"
+            },
+            "green_environment": {
+                "version": new_version,
+                "instances": 4,
+                "health_check_url": "/health",
+                "load_balancer": "green-lb"
+            },
+            "rollback_enabled": True,
+            "health_check_timeout": 300,  # 5 minutes
+            "traffic_switch_method": "weighted"
+        }
+        
+        # Start deployment
+        deployment_id = await deployment_service.start_deployment(
+            config=deployment_config,
+            initiated_by="ci-pipeline"
+        )
+        
+        # Deploy to green environment
+        green_deployment = await deployment_service.deploy_to_environment(
+            deployment_id=deployment_id,
+            environment="green",
+            version=new_version
+        )
+        
+        assert green_deployment["status"] == "deploying"
+        assert green_deployment["instances_deployed"] == 0
+        
+        # Simulate instance deployment
+        for i in range(4):
+            await deployment_service.update_instance_status(
+                deployment_id=deployment_id,
+                environment="green",
+                instance_id=f"green-{i}",
+                status="healthy"
+            )
+        
+        # Run health checks
+        health_status = await deployment_service.run_health_checks(
+            deployment_id=deployment_id,
+            environment="green"
+        )
+        
+        assert health_status["healthy_instances"] == 4
+        assert health_status["overall_status"] == "healthy"
+        
+        # Switch traffic gradually
+        traffic_switches = [
+            {"blue": 90, "green": 10},  # Canary
+            {"blue": 50, "green": 50},  # 50/50
+            {"blue": 10, "green": 90},  # Almost complete
+            {"blue": 0, "green": 100}   # Full switch
+        ]
+        
+        for weights in traffic_switches:
+            result = await deployment_service.update_traffic_weights(
+                deployment_id=deployment_id,
+                weights=weights
+            )
+            
+            assert result["current_weights"] == weights
+            
+            # Simulate monitoring during traffic shift
+            metrics = await deployment_service.get_deployment_metrics(
+                deployment_id=deployment_id
+            )
+            
+            assert metrics["error_rate"] < 0.01  # Less than 1% errors
+            assert metrics["response_time_p95"] < 200  # Under 200ms
+            
+            # Small delay between switches
+            await asyncio.sleep(0.1)
+        
+        # Complete deployment
+        completion = await deployment_service.complete_deployment(
+            deployment_id=deployment_id
+        )
+        
+        assert completion["status"] == "completed"
+        assert completion["active_environment"] == "green"
+        assert completion["deployment_duration"] < 600  # Under 10 minutes
+    
+    @pytest.mark.asyncio
+    async def test_rollback_on_failure_tc_deploy_002(
+        self,
+        deployment_service: DeploymentService,
+        monitoring_service: MonitoringService
+    ):
+        """TC-DEPLOY-002: Test automatic rollback on deployment failure"""
+        # Start deployment
+        deployment_config = {
+            "strategy": "blue-green",
+            "rollback_enabled": True,
+            "rollback_triggers": {
+                "error_rate_threshold": 0.05,  # 5%
+                "response_time_threshold": 500,  # ms
+                "health_check_failures": 2
+            }
+        }
+        
+        deployment_id = await deployment_service.start_deployment(
+            config=deployment_config
+        )
+        
+        # Deploy new version
+        await deployment_service.deploy_to_environment(
+            deployment_id=deployment_id,
+            environment="green",
+            version="v1.2.0-buggy"
+        )
+        
+        # Simulate deployment issues
+        await monitoring_service.record_metric(
+            metric_name="deployment.error_rate",
+            value=0.08,  # 8% error rate
+            tags={"deployment_id": deployment_id}
+        )
+        
+        # Check rollback trigger
+        rollback_triggered = await deployment_service.check_rollback_conditions(
+            deployment_id=deployment_id
+        )
+        
+        assert rollback_triggered is True
+        
+        # Execute rollback
+        rollback_result = await deployment_service.execute_rollback(
+            deployment_id=deployment_id,
+            reason="High error rate detected"
+        )
+        
+        assert rollback_result["status"] == "rolled_back"
+        assert rollback_result["rollback_duration"] < 60  # Under 1 minute
+        assert rollback_result["traffic_restored_to"] == "blue"
+        
+        # Verify system stability after rollback
+        post_rollback_metrics = await monitoring_service.get_current_metrics()
+        assert post_rollback_metrics["error_rate"] < 0.01
+    
+    @pytest.mark.asyncio
+    async def test_database_migration_during_deployment_tc_deploy_003(
+        self,
+        deployment_service: DeploymentService,
+        db: AsyncSession
+    ):
+        """TC-DEPLOY-003: Test database migration handling during deployment"""
+        # Create migration plan
+        migration_plan = {
+            "version": "20240115_add_analytics_tables",
+            "type": "forward",
+            "steps": [
+                {
+                    "step": 1,
+                    "description": "Add analytics_events table",
+                    "sql": """
+                        CREATE TABLE IF NOT EXISTS analytics_events_new (
+                            id BIGSERIAL PRIMARY KEY,
+                            event_type VARCHAR(100),
+                            user_id INTEGER,
+                            created_at TIMESTAMP DEFAULT NOW()
+                        )
+                    """,
+                    "rollback_sql": "DROP TABLE IF EXISTS analytics_events_new"
+                },
+                {
+                    "step": 2,
+                    "description": "Create indexes",
+                    "sql": """
+                        CREATE INDEX idx_analytics_events_user 
+                        ON analytics_events_new(user_id)
+                    """,
+                    "rollback_sql": "DROP INDEX IF EXISTS idx_analytics_events_user"
+                }
+            ],
+            "compatibility": "backward",  # Old code can work with new schema
+            "estimated_duration": 30  # seconds
+        }
+        
+        # Start deployment with migration
+        deployment_id = await deployment_service.start_deployment(
+            config={
+                "strategy": "blue-green",
+                "database_migration": migration_plan
+            }
+        )
+        
+        # Execute migration
+        migration_result = await deployment_service.execute_migration(
+            deployment_id=deployment_id,
+            plan=migration_plan
+        )
+        
+        assert migration_result["status"] == "completed"
+        assert migration_result["steps_completed"] == 2
+        assert migration_result["duration"] < 60  # Under 1 minute
+        
+        # Verify migration
+        result = await db.execute("""
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables 
+                WHERE table_name = 'analytics_events_new'
+            )
+        """)
+        table_exists = result.scalar()
+        assert table_exists is True
+        
+        # Test rollback capability
+        rollback_result = await deployment_service.rollback_migration(
+            deployment_id=deployment_id,
+            plan=migration_plan
+        )
+        
+        assert rollback_result["status"] == "rolled_back"
+    
+    @pytest.mark.asyncio
+    async def test_cache_warming_during_deployment_tc_deploy_004(
+        self,
+        deployment_service: DeploymentService,
+        redis_client: aioredis.Redis
+    ):
+        """TC-DEPLOY-004: Test cache warming during deployment"""
+        # Define cache warming strategy
+        warming_config = {
+            "strategies": [
+                {
+                    "name": "popular_devices",
+                    "query": "SELECT * FROM devices ORDER BY view_count DESC LIMIT 1000",
+                    "cache_key_pattern": "device:{}",
+                    "ttl": 3600
+                },
+                {
+                    "name": "user_sessions",
+                    "source": "active_sessions",
+                    "cache_key_pattern": "session:{}",
+                    "ttl": 86400
+                },
+                {
+                    "name": "search_results",
+                    "top_searches": 100,
+                    "cache_key_pattern": "search:{}",
+                    "ttl": 900
+                }
+            ],
+            "parallel_workers": 4,
+            "batch_size": 100
+        }
+        
+        # Start cache warming
+        warming_result = await deployment_service.warm_cache(
+            deployment_id="deploy-123",
+            config=warming_config,
+            target_environment="green"
+        )
+        
+        assert warming_result["total_keys_warmed"] > 0
+        assert warming_result["strategies_completed"] == 3
+        assert warming_result["duration"] < 300  # Under 5 minutes
+        
+        # Verify cache hit rate improvement
+        initial_hit_rate = 0.0
+        final_hit_rate = await deployment_service.get_cache_hit_rate(
+            environment="green"
+        )
+        
+        assert final_hit_rate > 0.8  # 80% hit rate after warming
+        
+        # Test specific cache entries
+        popular_device = await redis_client.get("device:1")
+        assert popular_device is not None
+    
+    @pytest.mark.asyncio
+    async def test_feature_flag_deployment_tc_deploy_005(
+        self,
+        deployment_service: DeploymentService,
+        feature_flag_service: FeatureFlagService
+    ):
+        """TC-DEPLOY-005: Test feature flag controlled deployment"""
+        # Create feature flags for new features
+        flags = [
+            {
+                "name": "new_ai_chat",
+                "description": "Enhanced AI chat with GPT-4",
+                "default_enabled": False,
+                "rollout_percentage": 0,
+                "targeting_rules": []
+            },
+            {
+                "name": "advanced_analytics",
+                "description": "New analytics dashboard",
+                "default_enabled": False,
+                "rollout_percentage": 0,
+                "targeting_rules": []
+            }
+        ]
+        
+        for flag in flags:
+            await feature_flag_service.create_flag(flag)
+        
+        # Deploy with feature flags
+        deployment_config = {
+            "version": "v2.0.0",
+            "feature_flags": {
+                "new_ai_chat": {
+                    "rollout_strategy": "percentage",
+                    "stages": [
+                        {"percentage": 5, "duration_hours": 24},
+                        {"percentage": 25, "duration_hours": 48},
+                        {"percentage": 50, "duration_hours": 72},
+                        {"percentage": 100, "duration_hours": None}
+                    ]
+                },
+                "advanced_analytics": {
+                    "rollout_strategy": "targeted",
+                    "targets": [
+                        {"type": "organization", "ids": [1, 2, 3]},
+                        {"type": "role", "values": ["super_admin"]}
+                    ]
+                }
+            }
+        }
+        
+        deployment_id = await deployment_service.start_deployment(
+            config=deployment_config
+        )
+        
+        # Test gradual rollout
+        for stage in deployment_config["feature_flags"]["new_ai_chat"]["stages"]:
+            result = await feature_flag_service.update_rollout_percentage(
+                flag_name="new_ai_chat",
+                percentage=stage["percentage"]
+            )
+            
+            assert result["current_percentage"] == stage["percentage"]
+            
+            # Verify flag evaluation for different users
+            enabled_count = 0
+            for i in range(100):
+                user_context = {"user_id": i, "organization_id": 1}
+                is_enabled = await feature_flag_service.is_enabled(
+                    flag_name="new_ai_chat",
+                    context=user_context
+                )
+                if is_enabled:
+                    enabled_count += 1
+            
+            # Allow some variance in percentage
+            expected = stage["percentage"]
+            assert abs(enabled_count - expected) < 10
+    
+    @pytest.mark.asyncio
+    async def test_canary_deployment_tc_deploy_006(
+        self,
+        deployment_service: DeploymentService,
+        monitoring_service: MonitoringService
+    ):
+        """TC-DEPLOY-006: Test canary deployment with automatic promotion"""
+        # Configure canary deployment
+        canary_config = {
+            "strategy": "canary",
+            "initial_percentage": 5,
+            "increment_percentage": 20,
+            "increment_interval_minutes": 30,
+            "success_criteria": {
+                "error_rate_threshold": 0.01,  # 1%
+                "response_time_p99": 500,  # ms
+                "cpu_usage_max": 80,  # percentage
+                "memory_usage_max": 85  # percentage
+            },
+            "monitoring_duration_minutes": 15
+        }
+        
+        deployment_id = await deployment_service.start_canary_deployment(
+            config=canary_config,
+            version="v1.3.0"
+        )
+        
+        # Monitor canary performance
+        stages = [5, 25, 45, 65, 85, 100]
+        for target_percentage in stages:
+            # Update traffic split
+            await deployment_service.update_canary_traffic(
+                deployment_id=deployment_id,
+                percentage=target_percentage
+            )
+            
+            # Simulate monitoring period
+            monitoring_result = await monitoring_service.monitor_canary(
+                deployment_id=deployment_id,
+                duration_seconds=60  # Shortened for test
+            )
+            
+            # Check success criteria
+            meets_criteria = all([
+                monitoring_result["error_rate"] < canary_config["success_criteria"]["error_rate_threshold"],
+                monitoring_result["response_time_p99"] < canary_config["success_criteria"]["response_time_p99"],
+                monitoring_result["cpu_usage"] < canary_config["success_criteria"]["cpu_usage_max"],
+                monitoring_result["memory_usage"] < canary_config["success_criteria"]["memory_usage_max"]
+            ])
+            
+            assert meets_criteria is True
+            
+            # Log promotion
+            logger.info(f"Canary promoted to {target_percentage}% traffic")
+        
+        # Complete canary deployment
+        completion = await deployment_service.complete_canary(
+            deployment_id=deployment_id
+        )
+        
+        assert completion["final_percentage"] == 100
+        assert completion["total_duration_minutes"] < 180  # Under 3 hours
+
+
+class TestMonitoringObservability:
+    """Test monitoring and observability features"""
+    
+    @pytest.mark.asyncio
+    async def test_application_metrics_collection_tc_deploy_007(
+        self,
+        monitoring_service: MonitoringService,
+        client: AsyncClient
+    ):
+        """TC-DEPLOY-007: Test application metrics collection"""
+        # Generate some application activity
+        endpoints = [
+            "/api/v1/devices/search",
+            "/api/v1/auth/login",
+            "/api/v1/chat/conversations",
+            "/health"
+        ]
+        
+        for endpoint in endpoints:
+            for _ in range(10):
+                if endpoint == "/api/v1/auth/login":
+                    response = await client.post(endpoint, json={
+                        "username": "test@example.com",
+                        "password": "password"
+                    })
+                else:
+                    response = await client.get(endpoint)
+        
+        # Collect metrics
+        metrics = await monitoring_service.collect_application_metrics()
+        
+        # Verify metric categories
+        assert "request_rate" in metrics
+        assert "error_rate" in metrics
+        assert "response_time" in metrics
+        assert "active_users" in metrics
+        assert "database_connections" in metrics
+        
+        # Check specific metrics
+        assert metrics["request_rate"]["total"] > 0
+        assert metrics["response_time"]["p95"] < 500  # Under 500ms
+        assert metrics["error_rate"]["percentage"] < 5  # Under 5%
+        
+        # Verify Prometheus format
+        prometheus_metrics = await monitoring_service.export_prometheus_metrics()
+        
+        families = list(text_string_to_metric_families(prometheus_metrics))
+        metric_names = [family.name for family in families]
+        
+        expected_metrics = [
+            "http_requests_total",
+            "http_request_duration_seconds",
+            "http_requests_in_progress",
+            "database_connections_active",
+            "cache_hit_ratio"
+        ]
+        
+        for expected in expected_metrics:
+            assert expected in metric_names
+    
+    @pytest.mark.asyncio
+    async def test_distributed_tracing_tc_deploy_008(
+        self,
+        monitoring_service: MonitoringService,
+        client: AsyncClient
+    ):
+        """TC-DEPLOY-008: Test distributed tracing implementation"""
+        # Make a request that spans multiple services
+        headers = {
+            "X-Trace-ID": "test-trace-123",
+            "X-Span-ID": "root-span"
+        }
+        
+        response = await client.post(
+            "/api/v1/devices/search",
+            json={"query": "infusion pump"},
+            headers=headers
+        )
+        
+        # Get trace data
+        trace = await monitoring_service.get_trace("test-trace-123")
+        
+        assert trace is not None
+        assert len(trace["spans"]) > 1
+        
+        # Verify trace structure
+        root_span = next(s for s in trace["spans"] if s["id"] == "root-span")
+        assert root_span["operation"] == "POST /api/v1/devices/search"
+        
+        # Check for expected spans
+        span_operations = [span["operation"] for span in trace["spans"]]
+        expected_operations = [
+            "auth.verify_token",
+            "database.query",
+            "elasticsearch.search",
+            "cache.get",
+            "response.serialize"
+        ]
+        
+        for expected_op in expected_operations:
+            assert any(expected_op in op for op in span_operations)
+        
+        # Verify timing data
+        total_duration = trace["duration_ms"]
+        assert total_duration < 500  # Under 500ms
+        
+        # Check for errors in trace
+        error_spans = [s for s in trace["spans"] if s.get("error")]
+        assert len(error_spans) == 0
+    
+    @pytest.mark.asyncio
+    async def test_error_tracking_and_alerting_tc_deploy_009(
+        self,
+        monitoring_service: MonitoringService,
+        db: AsyncSession
+    ):
+        """TC-DEPLOY-009: Test error tracking and alerting"""
+        # Configure error alerts
+        alert_rules = [
+            {
+                "name": "high_error_rate",
+                "condition": "error_rate > 5",
+                "window_minutes": 5,
+                "severity": "critical",
+                "channels": ["pagerduty", "slack"]
+            },
+            {
+                "name": "database_connection_pool",
+                "condition": "db_connections_used > 90",
+                "window_minutes": 1,
+                "severity": "warning",
+                "channels": ["slack"]
+            },
+            {
+                "name": "response_time_degradation",
+                "condition": "response_time_p95 > 1000",
+                "window_minutes": 10,
+                "severity": "warning",
+                "channels": ["email"]
+            }
+        ]
+        
+        for rule in alert_rules:
+            await monitoring_service.create_alert_rule(rule)
+        
+        # Simulate errors
+        error_types = [
+            {"type": "ValueError", "message": "Invalid device ID"},
+            {"type": "DatabaseError", "message": "Connection timeout"},
+            {"type": "AuthenticationError", "message": "Invalid token"}
+        ]
+        
+        for error in error_types:
+            for _ in range(3):
+                await monitoring_service.track_error(
+                    error_type=error["type"],
+                    error_message=error["message"],
+                    stack_trace="Full stack trace here...",
+                    context={
+                        "user_id": 123,
+                        "endpoint": "/api/v1/devices/search",
+                        "request_id": "req-456"
+                    }
+                )
+        
+        # Check error aggregation
+        error_summary = await monitoring_service.get_error_summary(
+            time_window_minutes=60
+        )
+        
+        assert error_summary["total_errors"] == 9
+        assert len(error_summary["errors_by_type"]) == 3
+        assert error_summary["top_error"]["count"] == 3
+        
+        # Verify Sentry integration
+        with patch('sentry_sdk.capture_exception') as mock_sentry:
+            try:
+                raise ValueError("Test error for Sentry")
+            except Exception as e:
+                await monitoring_service.report_exception(e)
+            
+            mock_sentry.assert_called_once()
+    
+    @pytest.mark.asyncio
+    async def test_infrastructure_monitoring_tc_deploy_010(
+        self,
+        monitoring_service: MonitoringService
+    ):
+        """TC-DEPLOY-010: Test infrastructure monitoring"""
+        # Collect infrastructure metrics
+        infra_metrics = await monitoring_service.collect_infrastructure_metrics()
+        
+        # Verify system metrics
+        assert "cpu" in infra_metrics
+        assert "memory" in infra_metrics
+        assert "disk" in infra_metrics
+        assert "network" in infra_metrics
+        
+        # Check CPU metrics
+        cpu_metrics = infra_metrics["cpu"]
+        assert 0 <= cpu_metrics["usage_percent"] <= 100
+        assert cpu_metrics["load_average"]["1m"] >= 0
+        
+        # Check memory metrics
+        memory_metrics = infra_metrics["memory"]
+        assert memory_metrics["used_percent"] < 90  # Alert if over 90%
+        assert memory_metrics["available_gb"] > 1
+        
+        # Check disk metrics
+        disk_metrics = infra_metrics["disk"]
+        assert disk_metrics["used_percent"] < 80  # Alert if over 80%
+        assert disk_metrics["iops"]["read"] >= 0
+        assert disk_metrics["iops"]["write"] >= 0
+        
+        # Check container metrics (if running in container)
+        if await monitoring_service.is_containerized():
+            container_metrics = await monitoring_service.get_container_metrics()
+            
+            assert container_metrics["container_count"] > 0
+            assert "cpu_throttled_percentage" in container_metrics
+            assert "memory_limit_gb" in container_metrics
+    
+    @pytest.mark.asyncio
+    async def test_log_aggregation_and_search_tc_deploy_011(
+        self,
+        monitoring_service: MonitoringService,
+        client: AsyncClient
+    ):
+        """TC-DEPLOY-011: Test log aggregation and search"""
+        # Generate various log entries
+        log_entries = [
+            {
+                "level": "INFO",
+                "message": "User login successful",
+                "user_id": 123,
+                "ip_address": "192.168.1.1"
+            },
+            {
+                "level": "WARNING",
+                "message": "Rate limit approaching",
+                "endpoint": "/api/v1/devices/search",
+                "current_rate": 95
+            },
+            {
+                "level": "ERROR",
+                "message": "Database connection failed",
+                "error": "timeout after 30s",
+                "retry_count": 3
+            }
+        ]
+        
+        for entry in log_entries:
+            logger.log(
+                getattr(logging, entry["level"]),
+                entry["message"],
+                extra={k: v for k, v in entry.items() if k not in ["level", "message"]}
+            )
+        
+        # Search logs
+        search_results = await monitoring_service.search_logs(
+            query="user_id:123",
+            time_range="last_hour",
+            limit=10
+        )
+        
+        assert len(search_results["results"]) > 0
+        assert search_results["results"][0]["user_id"] == 123
+        
+        # Test log parsing
+        parsed_logs = await monitoring_service.parse_structured_logs(
+            log_pattern=r"(?P<timestamp>\S+) (?P<level>\S+) (?P<message>.*)"
+        )
+        
+        assert len(parsed_logs) > 0
+        
+        # Test log retention
+        retention_info = await monitoring_service.get_log_retention_info()
+        assert retention_info["retention_days"] == 30
+        assert retention_info["total_size_gb"] < 100
+    
+    @pytest.mark.asyncio
+    async def test_performance_profiling_tc_deploy_012(
+        self,
+        monitoring_service: MonitoringService,
+        client: AsyncClient
+    ):
+        """TC-DEPLOY-012: Test performance profiling capabilities"""
+        # Enable profiling for specific endpoint
+        await monitoring_service.enable_profiling(
+            endpoint="/api/v1/devices/search",
+            sample_rate=1.0  # 100% for testing
+        )
+        
+        # Make requests to profile
+        for _ in range(5):
+            await client.post(
+                "/api/v1/devices/search",
+                json={"query": "test", "filters": {"class": "II"}}
+            )
+        
+        # Get profiling data
+        profile_data = await monitoring_service.get_profile_data(
+            endpoint="/api/v1/devices/search"
+        )
+        
+        assert profile_data is not None
+        assert "cpu_time" in profile_data
+        assert "memory_allocations" in profile_data
+        assert "database_queries" in profile_data
+        
+        # Analyze performance bottlenecks
+        bottlenecks = await monitoring_service.analyze_bottlenecks(
+            profile_data=profile_data
+        )
+        
+        assert len(bottlenecks) >= 0
+        if bottlenecks:
+            top_bottleneck = bottlenecks[0]
+            assert "function" in top_bottleneck
+            assert "time_percentage" in top_bottleneck
+            assert top_bottleneck["time_percentage"] <= 100
+        
+        # Disable profiling
+        await monitoring_service.disable_profiling(
+            endpoint="/api/v1/devices/search"
+        )
+
+
+class TestHealthChecksAndReadiness:
+    """Test health check and readiness probe implementations"""
+    
+    @pytest.mark.asyncio
+    async def test_comprehensive_health_check_tc_deploy_013(
+        self,
+        health_check_service: HealthCheckService,
+        client: AsyncClient
+    ):
+        """TC-DEPLOY-013: Test comprehensive health check endpoint"""
+        # Perform health check
+        response = await client.get("/health")
+        assert response.status_code == 200
+        
+        health_data = response.json()
+        
+        # Verify all components checked
+        expected_components = [
+            "database",
+            "redis",
+            "elasticsearch",
+            "s3",
+            "openai",
+            "email_service",
+            "background_jobs"
+        ]
+        
+        for component in expected_components:
+            assert component in health_data["components"]
+            component_health = health_data["components"][component]
+            assert "status" in component_health
+            assert "response_time_ms" in component_health
+            assert component_health["status"] in ["healthy", "degraded", "unhealthy"]
+        
+        # Check overall status
+        assert health_data["overall_status"] in ["healthy", "degraded", "unhealthy"]
+        assert health_data["version"] == settings.APP_VERSION
+        assert "timestamp" in health_data
+    
+    @pytest.mark.asyncio
+    async def test_readiness_probe_tc_deploy_014(
+        self,
+        health_check_service: HealthCheckService,
+        client: AsyncClient
+    ):
+        """TC-DEPLOY-014: Test Kubernetes readiness probe"""
+        # Test readiness endpoint
+        response = await client.get("/ready")
+        
+        if response.status_code == 200:
+            ready_data = response.json()
+            assert ready_data["ready"] is True
+            assert ready_data["initialized"] is True
+            
+            # Verify critical services ready
+            assert ready_data["database_migrations"] == "completed"
+            assert ready_data["cache_warmed"] is True
+            assert ready_data["background_workers"] > 0
+        else:
+            # Service not ready
+            assert response.status_code == 503
+            not_ready_data = response.json()
+            assert not_ready_data["ready"] is False
+            assert "reasons" in not_ready_data
+    
+    @pytest.mark.asyncio
+    async def test_liveness_probe_tc_deploy_015(
+        self,
+        client: AsyncClient
+    ):
+        """TC-DEPLOY-015: Test Kubernetes liveness probe"""
+        # Test liveness endpoint
+        response = await client.get("/alive")
+        
+        assert response.status_code == 200
+        alive_data = response.json()
+        
+        assert alive_data["alive"] is True
+        assert "uptime_seconds" in alive_data
+        assert alive_data["uptime_seconds"] > 0
+        
+        # Test should be lightweight - no external dependencies
+        assert "pid" in alive_data
+        assert alive_data["pid"] == os.getpid()
+    
+    @pytest.mark.asyncio
+    async def test_dependency_health_checks_tc_deploy_016(
+        self,
+        health_check_service: HealthCheckService,
+        db: AsyncSession,
+        redis_client: aioredis.Redis
+    ):
+        """TC-DEPLOY-016: Test individual dependency health checks"""
+        # Test database health
+        db_health = await health_check_service.check_database_health()
+        assert db_health["status"] == "healthy"
+        assert db_health["response_time_ms"] < 100
+        assert db_health["active_connections"] < 100
+        assert db_health["pool_size"] > 0
+        
+        # Test Redis health
+        redis_health = await health_check_service.check_redis_health()
+        assert redis_health["status"] == "healthy"
+        assert redis_health["response_time_ms"] < 50
+        assert redis_health["memory_used_mb"] < 1000
+        assert redis_health["connected_clients"] > 0
+        
+        # Test Elasticsearch health
+        es_health = await health_check_service.check_elasticsearch_health()
+        assert es_health["status"] in ["green", "yellow"]
+        assert es_health["number_of_nodes"] > 0
+        assert es_health["active_shards"] > 0
+        
+        # Test S3 health
+        s3_health = await health_check_service.check_s3_health()
+        assert s3_health["status"] == "healthy"
+        assert s3_health["bucket_accessible"] is True
+        assert s3_health["response_time_ms"] < 500
+
+
+class TestRollbackMechanisms:
+    """Test rollback mechanisms and disaster recovery"""
+    
+    @pytest.mark.asyncio
+    async def test_code_rollback_tc_deploy_017(
+        self,
+        rollback_service: RollbackService,
+        deployment_service: DeploymentService
+    ):
+        """TC-DEPLOY-017: Test code rollback mechanism"""
+        # Create deployment history
+        deployments = [
+            {"version": "v1.0.0", "timestamp": datetime.utcnow() - timedelta(days=7)},
+            {"version": "v1.1.0", "timestamp": datetime.utcnow() - timedelta(days=3)},
+            {"version": "v1.2.0", "timestamp": datetime.utcnow() - timedelta(hours=1)}
+        ]
+        
+        for deployment in deployments:
+            await deployment_service.record_deployment(
+                version=deployment["version"],
+                timestamp=deployment["timestamp"],
+                status="completed"
+            )
+        
+        # Initiate rollback to previous version
+        rollback_result = await rollback_service.rollback_to_version(
+            target_version="v1.1.0",
+            reason="Critical bug in v1.2.0"
+        )
+        
+        assert rollback_result["status"] == "completed"
+        assert rollback_result["from_version"] == "v1.2.0"
+        assert rollback_result["to_version"] == "v1.1.0"
+        assert rollback_result["duration_seconds"] < 300  # Under 5 minutes
+        
+        # Verify rollback
+        current_version = await deployment_service.get_current_version()
+        assert current_version == "v1.1.0"
+    
+    @pytest.mark.asyncio
+    async def test_database_rollback_tc_deploy_018(
+        self,
+        rollback_service: RollbackService,
+        db: AsyncSession
+    ):
+        """TC-DEPLOY-018: Test database schema rollback"""
+        # Apply migration
+        migration = {
+            "version": "20240116_add_feature_table",
+            "up_sql": """
+                CREATE TABLE feature_flags (
+                    id SERIAL PRIMARY KEY,
+                    name VARCHAR(100) UNIQUE,
+                    enabled BOOLEAN DEFAULT false
+                );
+            """,
+            "down_sql": "DROP TABLE IF EXISTS feature_flags;"
+        }
+        
+        # Apply forward migration
+        await db.execute(migration["up_sql"])
+        await db.commit()
+        
+        # Verify table exists
+        result = await db.execute("""
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables 
+                WHERE table_name = 'feature_flags'
+            )
+        """)
+        assert result.scalar() is True
+        
+        # Rollback migration
+        rollback_result = await rollback_service.rollback_migration(
+            migration_version=migration["version"],
+            down_sql=migration["down_sql"]
+        )
+        
+        assert rollback_result["status"] == "rolled_back"
+        
+        # Verify table removed
+        result = await db.execute("""
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables 
+                WHERE table_name = 'feature_flags'
+            )
+        """)
+        assert result.scalar() is False
+    
+    @pytest.mark.asyncio
+    async def test_configuration_rollback_tc_deploy_019(
+        self,
+        rollback_service: RollbackService
+    ):
+        """TC-DEPLOY-019: Test configuration rollback"""
+        # Create configuration snapshots
+        config_v1 = {
+            "version": "config-v1",
+            "timestamp": datetime.utcnow() - timedelta(hours=2),
+            "settings": {
+                "rate_limit": 100,
+                "cache_ttl": 3600,
+                "feature_flags": {
+                    "new_ui": False,
+                    "beta_features": False
+                }
+            }
+        }
+        
+        config_v2 = {
+            "version": "config-v2",
+            "timestamp": datetime.utcnow(),
+            "settings": {
+                "rate_limit": 50,  # Problematic change
+                "cache_ttl": 1800,
+                "feature_flags": {
+                    "new_ui": True,
+                    "beta_features": True
+                }
+            }
+        }
+        
+        # Save configurations
+        await rollback_service.save_configuration_snapshot(config_v1)
+        await rollback_service.save_configuration_snapshot(config_v2)
+        
+        # Rollback to previous configuration
+        rollback_result = await rollback_service.rollback_configuration(
+            target_version="config-v1",
+            reason="Rate limit too restrictive"
+        )
+        
+        assert rollback_result["status"] == "completed"
+        assert rollback_result["changes_reverted"] == 3
+        
+        # Verify configuration restored
+        current_config = await rollback_service.get_current_configuration()
+        assert current_config["settings"]["rate_limit"] == 100
+        assert current_config["settings"]["feature_flags"]["new_ui"] is False
+    
+    @pytest.mark.asyncio
+    async def test_disaster_recovery_tc_deploy_020(
+        self,
+        rollback_service: RollbackService,
+        db: AsyncSession
+    ):
+        """TC-DEPLOY-020: Test disaster recovery procedures"""
+        # Create backup point
+        backup_result = await rollback_service.create_backup(
+            backup_type="full",
+            components=["database", "redis", "files"],
+            description="Pre-deployment backup"
+        )
+        
+        assert backup_result["status"] == "completed"
+        assert backup_result["backup_id"] is not None
+        assert all(c["status"] == "completed" for c in backup_result["components"])
+        
+        # Simulate disaster scenario
+        disaster_scenario = {
+            "type": "data_corruption",
+            "affected_tables": ["users", "devices"],
+            "corruption_detected_at": datetime.utcnow()
+        }
+        
+        # Initiate disaster recovery
+        recovery_result = await rollback_service.initiate_disaster_recovery(
+            backup_id=backup_result["backup_id"],
+            scenario=disaster_scenario
+        )
+        
+        assert recovery_result["status"] == "completed"
+        assert recovery_result["data_restored"] is True
+        assert recovery_result["recovery_time_minutes"] < 240  # RTO under 4 hours
+        
+        # Verify data integrity after recovery
+        integrity_check = await rollback_service.verify_data_integrity()
+        assert integrity_check["all_checks_passed"] is True
+        assert len(integrity_check["errors"]) == 0
+
+
+class TestFeatureFlagManagement:
+    """Test feature flag management during deployments"""
+    
+    @pytest.mark.asyncio
+    async def test_feature_flag_creation_tc_deploy_021(
+        self,
+        feature_flag_service: FeatureFlagService,
+        db: AsyncSession
+    ):
+        """TC-DEPLOY-021: Test feature flag creation and management"""
+        # Create feature flag
+        flag_config = {
+            "name": "enhanced_search",
+            "description": "New search algorithm with ML",
+            "type": "boolean",
+            "default_value": False,
+            "environments": {
+                "development": True,
+                "staging": True,
+                "production": False
+            },
+            "tags": ["search", "ml", "experimental"]
+        }
+        
+        flag = await feature_flag_service.create_flag(flag_config)
+        
+        assert flag["id"] is not None
+        assert flag["name"] == "enhanced_search"
+        assert flag["created_at"] is not None
+        
+        # Test flag evaluation
+        contexts = [
+            {"environment": "development", "expected": True},
+            {"environment": "production", "expected": False},
+            {"environment": "unknown", "expected": False}  # Default
+        ]
+        
+        for context in contexts:
+            is_enabled = await feature_flag_service.evaluate_flag(
+                flag_name="enhanced_search",
+                context={"environment": context["environment"]}
+            )
+            assert is_enabled == context["expected"]
+    
+    @pytest.mark.asyncio
+    async def test_percentage_rollout_tc_deploy_022(
+        self,
+        feature_flag_service: FeatureFlagService
+    ):
+        """TC-DEPLOY-022: Test percentage-based feature rollout"""
+        # Create flag with percentage rollout
+        flag_config = {
+            "name": "new_dashboard",
+            "type": "boolean",
+            "default_value": False,
+            "rollout_strategy": {
+                "type": "percentage",
+                "percentage": 25,  # 25% of users
+                "sticky": True  # Same users always get the feature
+            }
+        }
+        
+        flag = await feature_flag_service.create_flag(flag_config)
+        
+        # Test distribution across many users
+        enabled_count = 0
+        total_users = 1000
+        
+        user_decisions = {}
+        for user_id in range(total_users):
+            is_enabled = await feature_flag_service.evaluate_flag(
+                flag_name="new_dashboard",
+                context={"user_id": user_id}
+            )
+            user_decisions[user_id] = is_enabled
+            if is_enabled:
+                enabled_count += 1
+        
+        # Check percentage is roughly correct (allow 5% variance)
+        expected_percentage = 25
+        actual_percentage = (enabled_count / total_users) * 100
+        assert abs(actual_percentage - expected_percentage) < 5
+        
+        # Verify stickiness - same user always gets same decision
+        for user_id in range(100):  # Test subset
+            second_evaluation = await feature_flag_service.evaluate_flag(
+                flag_name="new_dashboard",
+                context={"user_id": user_id}
+            )
+            assert second_evaluation == user_decisions[user_id]
+    
+    @pytest.mark.asyncio
+    async def test_targeted_rollout_tc_deploy_023(
+        self,
+        feature_flag_service: FeatureFlagService,
+        db: AsyncSession
+    ):
+        """TC-DEPLOY-023: Test targeted feature rollout"""
+        # Create organizations and users for testing
+        orgs = []
+        for i in range(3):
+            org = await OrganizationFactory.create(
+                name=f"Test Hospital {i}",
+                type="hospital"
+            )
+            orgs.append(org)
+        
+        # Create flag with targeting rules
+        flag_config = {
+            "name": "advanced_analytics",
+            "type": "boolean",
+            "default_value": False,
+            "targeting_rules": [
+                {
+                    "condition": {
+                        "attribute": "organization_id",
+                        "operator": "in",
+                        "values": [orgs[0].id, orgs[1].id]
+                    },
+                    "value": True
+                },
+                {
+                    "condition": {
+                        "attribute": "role",
+                        "operator": "equals",
+                        "value": "super_admin"
+                    },
+                    "value": True
+                },
+                {
+                    "condition": {
+                        "attribute": "email",
+                        "operator": "ends_with",
+                        "value": "@beta.nyelux.com"
+                    },
+                    "value": True
+                }
+            ]
+        }
+        
+        flag = await feature_flag_service.create_flag(flag_config)
+        
+        # Test targeting rules
+        test_cases = [
+            {
+                "context": {"organization_id": orgs[0].id, "role": "nurse"},
+                "expected": True  # Matches org rule
+            },
+            {
+                "context": {"organization_id": orgs[2].id, "role": "nurse"},
+                "expected": False  # No match
+            },
+            {
+                "context": {"organization_id": orgs[2].id, "role": "super_admin"},
+                "expected": True  # Matches role rule
+            },
+            {
+                "context": {"email": "tester@beta.nyelux.com", "role": "user"},
+                "expected": True  # Matches email rule
+            }
+        ]
+        
+        for test_case in test_cases:
+            is_enabled = await feature_flag_service.evaluate_flag(
+                flag_name="advanced_analytics",
+                context=test_case["context"]
+            )
+            assert is_enabled == test_case["expected"]
+    
+    @pytest.mark.asyncio
+    async def test_flag_audit_trail_tc_deploy_024(
+        self,
+        feature_flag_service: FeatureFlagService,
+        db: AsyncSession
+    ):
+        """TC-DEPLOY-024: Test feature flag audit trail"""
+        # Create and modify flag
+        flag = await feature_flag_service.create_flag({
+            "name": "test_feature",
+            "type": "boolean",
+            "default_value": False
+        })
+        
+        # Make changes
+        changes = [
+            {"action": "update_value", "value": True},
+            {"action": "add_rule", "rule": {"attribute": "role", "operator": "equals", "value": "admin"}},
+            {"action": "update_percentage", "percentage": 50},
+            {"action": "disable", "reason": "Bug found"}
+        ]
+        
+        for change in changes:
+            if change["action"] == "update_value":
+                await feature_flag_service.update_flag(
+                    flag_name="test_feature",
+                    default_value=change["value"]
+                )
+            elif change["action"] == "disable":
+                await feature_flag_service.disable_flag(
+                    flag_name="test_feature",
+                    reason=change["reason"]
+                )
+            # Add other change types...
+        
+        # Get audit trail
+        audit_trail = await feature_flag_service.get_flag_audit_trail(
+            flag_name="test_feature"
+        )
+        
+        assert len(audit_trail) >= len(changes) + 1  # +1 for creation
+        
+        # Verify audit entries
+        for entry in audit_trail:
+            assert "timestamp" in entry
+            assert "action" in entry
+            assert "user_id" in entry or "system" in entry
+            assert "changes" in entry
+        
+        # Check specific audit entry
+        creation_entry = next(e for e in audit_trail if e["action"] == "created")
+        assert creation_entry is not None
+        assert creation_entry["changes"]["name"] == "test_feature"
+
+
+class TestContinuousDeployment:
+    """Test continuous deployment automation"""
+    
+    @pytest.mark.asyncio
+    async def test_ci_cd_pipeline_integration_tc_deploy_025(
+        self,
+        deployment_service: DeploymentService
+    ):
+        """TC-DEPLOY-025: Test CI/CD pipeline integration"""
+        # Simulate CI/CD webhook
+        pipeline_event = {
+            "event_type": "push",
+            "branch": "main",
+            "commit_sha": "abc123def456",
+            "commit_message": "feat: Add new device comparison feature",
+            "author": "developer@nyelux.com",
+            "timestamp": datetime.utcnow().isoformat(),
+            "ci_status": "passed",
+            "test_results": {
+                "total": 1500,
+                "passed": 1500,
+                "failed": 0,
+                "coverage": 92.5
+            }
+        }
+        
+        # Process pipeline event
+        deployment_decision = await deployment_service.process_pipeline_event(
+            event=pipeline_event
+        )
+        
+        assert deployment_decision["should_deploy"] is True
+        assert deployment_decision["deployment_type"] == "automatic"
+        assert deployment_decision["target_environment"] == "staging"
+        
+        # Verify deployment triggered
+        deployment = await deployment_service.get_latest_deployment()
+        assert deployment["commit_sha"] == pipeline_event["commit_sha"]
+        assert deployment["triggered_by"] == "ci_pipeline"
+    
+    @pytest.mark.asyncio
+    async def test_automated_rollback_criteria_tc_deploy_026(
+        self,
+        deployment_service: DeploymentService,
+        monitoring_service: MonitoringService
+    ):
+        """TC-DEPLOY-026: Test automated rollback based on metrics"""
+        # Configure rollback criteria
+        rollback_config = {
+            "enabled": True,
+            "monitoring_period_minutes": 15,
+            "criteria": [
+                {
+                    "metric": "error_rate",
+                    "threshold": 0.05,  # 5%
+                    "comparison": "greater_than"
+                },
+                {
+                    "metric": "response_time_p99",
+                    "threshold": 1000,  # 1 second
+                    "comparison": "greater_than"
+                },
+                {
+                    "metric": "apdex_score",
+                    "threshold": 0.8,
+                    "comparison": "less_than"
+                }
+            ]
+        }
+        
+        deployment_id = await deployment_service.start_deployment(
+            config={"rollback_config": rollback_config}
+        )
+        
+        # Simulate metric degradation
+        await monitoring_service.record_metric("error_rate", 0.08)  # 8% errors
+        await monitoring_service.record_metric("response_time_p99", 1500)  # 1.5s
+        await monitoring_service.record_metric("apdex_score", 0.7)  # Below threshold
+        
+        # Check if rollback triggered
+        rollback_check = await deployment_service.check_automated_rollback(
+            deployment_id=deployment_id
+        )
+        
+        assert rollback_check["should_rollback"] is True
+        assert len(rollback_check["triggered_criteria"]) == 3
+        assert rollback_check["recommendation"] == "immediate_rollback"
+    
+    @pytest.mark.asyncio
+    async def test_gradual_rollout_with_monitoring_tc_deploy_027(
+        self,
+        deployment_service: DeploymentService,
+        monitoring_service: MonitoringService
+    ):
+        """TC-DEPLOY-027: Test gradual rollout with continuous monitoring"""
+        # Configure gradual rollout
+        rollout_config = {
+            "strategy": "gradual",
+            "stages": [
+                {"percentage": 1, "duration_minutes": 30, "name": "canary"},
+                {"percentage": 5, "duration_minutes": 60, "name": "early_adopters"},
+                {"percentage": 25, "duration_minutes": 120, "name": "quarter"},
+                {"percentage": 50, "duration_minutes": 240, "name": "half"},
+                {"percentage": 100, "duration_minutes": None, "name": "full"}
+            ],
+            "pause_on_errors": True,
+            "success_criteria": {
+                "error_rate_max": 0.02,
+                "customer_complaints_max": 5
+            }
+        }
+        
+        deployment_id = await deployment_service.start_gradual_rollout(
+            config=rollout_config,
+            version="v2.1.0"
+        )
+        
+        # Simulate progression through stages
+        for stage in rollout_config["stages"]:
+            # Update rollout percentage
+            await deployment_service.update_rollout_stage(
+                deployment_id=deployment_id,
+                stage_name=stage["name"],
+                percentage=stage["percentage"]
+            )
+            
+            # Monitor metrics during stage
+            stage_metrics = await monitoring_service.get_stage_metrics(
+                deployment_id=deployment_id,
+                stage_name=stage["name"]
+            )
+            
+            # Verify metrics within bounds
+            assert stage_metrics["error_rate"] < rollout_config["success_criteria"]["error_rate_max"]
+            assert stage_metrics["user_satisfaction"] > 4.0  # Out of 5
+            
+            # Check if we should proceed
+            proceed_decision = await deployment_service.should_proceed_to_next_stage(
+                deployment_id=deployment_id,
+                current_stage=stage["name"]
+            )
+            
+            assert proceed_decision["can_proceed"] is True
+    
+    @pytest.mark.asyncio
+    async def test_deployment_approval_workflow_tc_deploy_028(
+        self,
+        deployment_service: DeploymentService,
+        db: AsyncSession
+    ):
+        """TC-DEPLOY-028: Test deployment approval workflow"""
+        # Create approval workflow
+        workflow_config = {
+            "production_deployment": {
+                "required_approvals": 2,
+                "approvers": [
+                    {"role": "engineering_manager", "required": True},
+                    {"role": "product_manager", "required": True},
+                    {"role": "qa_lead", "required": False}
+                ],
+                "auto_approve_after_hours": 24,
+                "block_on_failing_tests": True
+            }
+        }
+        
+        # Request deployment approval
+        approval_request = await deployment_service.request_deployment_approval(
+            version="v2.2.0",
+            environment="production",
+            changes_summary="New AI features and bug fixes",
+            workflow=workflow_config["production_deployment"]
+        )
+        
+        assert approval_request["status"] == "pending_approval"
+        assert approval_request["approvals_received"] == 0
+        assert approval_request["approvals_required"] == 2
+        
+        # Add approvals
+        approval1 = await deployment_service.add_approval(
+            request_id=approval_request["id"],
+            approver_id=1,
+            approver_role="engineering_manager",
+            decision="approved",
+            comments="LGTM, tests pass"
+        )
+        
+        assert approval1["approvals_received"] == 1
+        assert approval1["status"] == "pending_approval"
+        
+        approval2 = await deployment_service.add_approval(
+            request_id=approval_request["id"],
+            approver_id=2,
+            approver_role="product_manager",
+            decision="approved",
+            comments="Features verified in staging"
+        )
+        
+        assert approval2["approvals_received"] == 2
+        assert approval2["status"] == "approved"
+        assert approval2["can_deploy"] is True
+    
+    @pytest.mark.asyncio
+    async def test_deployment_scheduling_tc_deploy_029(
+        self,
+        deployment_service: DeploymentService
+    ):
+        """TC-DEPLOY-029: Test deployment scheduling and windows"""
+        # Configure deployment windows
+        deployment_windows = {
+            "production": {
+                "allowed_days": ["Tuesday", "Thursday"],
+                "allowed_hours": {"start": 14, "end": 16},  # 2-4 PM
+                "timezone": "America/New_York",
+                "blackout_dates": [
+                    "2024-12-24",  # Christmas Eve
+                    "2024-12-25",  # Christmas
+                    "2024-12-31",  # New Year's Eve
+                    "2025-01-01"   # New Year's Day
+                ]
+            }
+        }
+        
+        # Test deployment scheduling
+        proposed_time = datetime(2024, 1, 16, 15, 0)  # Tuesday 3 PM
+        
+        is_allowed = await deployment_service.is_deployment_allowed(
+            environment="production",
+            proposed_time=proposed_time,
+            windows_config=deployment_windows
+        )
+        
+        assert is_allowed is True
+        
+        # Test blackout date
+        blackout_time = datetime(2024, 12, 25, 15, 0)
+        is_allowed_blackout = await deployment_service.is_deployment_allowed(
+            environment="production",
+            proposed_time=blackout_time,
+            windows_config=deployment_windows
+        )
+        
+        assert is_allowed_blackout is False
+        
+        # Find next available window
+        next_window = await deployment_service.get_next_deployment_window(
+            environment="production",
+            after=datetime.utcnow(),
+            windows_config=deployment_windows
+        )
+        
+        assert next_window is not None
+        assert next_window.strftime("%A") in deployment_windows["production"]["allowed_days"]
+    
+    @pytest.mark.asyncio
+    async def test_multi_region_deployment_tc_deploy_030(
+        self,
+        deployment_service: DeploymentService
+    ):
+        """TC-DEPLOY-030: Test multi-region deployment coordination"""
+        # Configure regions
+        regions = [
+            {"name": "us-east-1", "primary": True, "weight": 40},
+            {"name": "us-west-2", "primary": False, "weight": 30},
+            {"name": "eu-west-1", "primary": False, "weight": 20},
+            {"name": "ap-southeast-1", "primary": False, "weight": 10}
+        ]
+        
+        # Start multi-region deployment
+        deployment_plan = await deployment_service.create_multi_region_deployment(
+            version="v2.3.0",
+            regions=regions,
+            strategy="rolling",  # Deploy one region at a time
+            delay_between_regions_minutes=30
+        )
+        
+        assert len(deployment_plan["stages"]) == len(regions)
+        assert deployment_plan["stages"][0]["region"] == "us-east-1"  # Primary first
+        
+        # Execute deployment to each region
+        for stage in deployment_plan["stages"]:
+            region_deployment = await deployment_service.deploy_to_region(
+                deployment_id=deployment_plan["id"],
+                region=stage["region"],
+                version="v2.3.0"
+            )
+            
+            assert region_deployment["status"] == "in_progress"
+            
+            # Simulate successful deployment
+            await deployment_service.mark_region_deployed(
+                deployment_id=deployment_plan["id"],
+                region=stage["region"],
+                success=True
+            )
+            
+            # Verify traffic shifting
+            traffic_config = await deployment_service.get_traffic_configuration()
+            assert traffic_config["regions"][stage["region"]]["version"] == "v2.3.0"
+        
+        # Verify all regions deployed
+        final_status = await deployment_service.get_deployment_status(
+            deployment_id=deployment_plan["id"]
+        )
+        
+        assert final_status["regions_deployed"] == len(regions)
+        assert final_status["overall_status"] == "completed"
+
+
+class TestDockerContainerManagement:
+    """Test Docker container and image management"""
+    
+    @pytest.mark.asyncio
+    async def test_docker_image_build_tc_deploy_031(
+        self,
+        deployment_service: DeploymentService
+    ):
+        """TC-DEPLOY-031: Test Docker image building process"""
+        # Build configuration
+        build_config = {
+            "dockerfile": "Dockerfile.production",
+            "context": ".",
+            "build_args": {
+                "PYTHON_VERSION": "3.11",
+                "APP_VERSION": "2.4.0",
+                "BUILD_DATE": datetime.utcnow().isoformat()
+            },
+            "target": "production",
+            "cache_from": ["nyelux/backend:latest"],
+            "labels": {
+                "version": "2.4.0",
+                "commit": "abc123",
+                "build_number": "456"
+            }
+        }
+        
+        # Start build
+        build_result = await deployment_service.build_docker_image(
+            config=build_config,
+            tag="nyelux/backend:2.4.0"
+        )
+        
+        assert build_result["status"] == "success"
+        assert build_result["image_id"] is not None
+        assert build_result["size_mb"] < 500  # Keep image size reasonable
+        
+        # Verify image
+        docker_client = docker.from_env()
+        image = docker_client.images.get("nyelux/backend:2.4.0")
+        
+        assert image is not None
+        assert "2.4.0" in image.tags
+        
+        # Test multi-stage build efficiency
+        assert len(image.history()) < 50  # Reasonable number of layers
+    
+    @pytest.mark.asyncio
+    async def test_container_health_checks_tc_deploy_032(
+        self,
+        deployment_service: DeploymentService
+    ):
+        """TC-DEPLOY-032: Test container health check configuration"""
+        # Container configuration with health check
+        container_config = {
+            "image": "nyelux/backend:latest",
+            "name": "nyelux-api",
+            "health_check": {
+                "test": ["CMD", "curl", "-f", "http://localhost:8000/health"],
+                "interval": 30,  # seconds
+                "timeout": 10,   # seconds
+                "retries": 3,
+                "start_period": 60  # seconds
+            },
+            "restart_policy": {
+                "name": "unless-stopped",
+                "maximum_retry_count": 5
+            }
+        }
+        
+        # Start container
+        container = await deployment_service.start_container(
+            config=container_config
+        )
+        
+        assert container["status"] == "running"
+        
+        # Wait for health check
+        await asyncio.sleep(container_config["health_check"]["start_period"] + 10)
+        
+        # Check container health
+        health_status = await deployment_service.get_container_health(
+            container_name="nyelux-api"
+        )
+        
+        assert health_status["status"] == "healthy"
+        assert health_status["failing_streak"] == 0
+        
+        # Test unhealthy scenario
+        await deployment_service.simulate_container_issue(
+            container_name="nyelux-api",
+            issue_type="health_check_failure"
+        )
+        
+        # Verify restart behavior
+        await asyncio.sleep(container_config["health_check"]["interval"] * 4)
+        
+        container_info = await deployment_service.get_container_info(
+            container_name="nyelux-api"
+        )
+        
+        assert container_info["restart_count"] > 0
+        assert container_info["status"] in ["running", "restarting"]
+    
+    @pytest.mark.asyncio
+    async def test_container_resource_limits_tc_deploy_033(
+        self,
+        deployment_service: DeploymentService
+    ):
+        """TC-DEPLOY-033: Test container resource limits and monitoring"""
+        # Configure resource limits
+        resource_config = {
+            "memory": {
+                "limit": "2g",
+                "reservation": "1g"
+            },
+            "cpu": {
+                "limit": 2.0,  # 2 CPUs
+                "reservation": 0.5  # 0.5 CPU
+            },
+            "pids": {
+                "limit": 1000  # Max processes
+            },
+            "ulimits": [
+                {"name": "nofile", "soft": 65536, "hard": 65536},
+                {"name": "nproc", "soft": 4096, "hard": 4096}
+            ]
+        }
+        
+        # Start container with limits
+        container = await deployment_service.start_container_with_limits(
+            image="nyelux/backend:latest",
+            resources=resource_config
+        )
+        
+        # Monitor resource usage
+        usage_stats = await deployment_service.get_container_stats(
+            container_id=container["id"]
+        )
+        
+        assert usage_stats["memory"]["usage_mb"] < 2048  # Under limit
+        assert usage_stats["cpu"]["usage_percent"] < 200  # Under 2 CPUs
+        
+        # Test OOM killer protection
+        stress_test_result = await deployment_service.stress_test_container(
+            container_id=container["id"],
+            test_type="memory",
+            target_usage_mb=2500  # Over limit
+        )
+        
+        assert stress_test_result["oom_killed"] is False
+        assert stress_test_result["memory_limited"] is True
+    
+    @pytest.mark.asyncio
+    async def test_image_vulnerability_scanning_tc_deploy_034(
+        self,
+        deployment_service: DeploymentService
+    ):
+        """TC-DEPLOY-034: Test container image vulnerability scanning"""
+        # Scan image for vulnerabilities
+        scan_result = await deployment_service.scan_image_vulnerabilities(
+            image="nyelux/backend:latest",
+            scan_type="comprehensive"
+        )
+        
+        assert scan_result["scan_completed"] is True
+        assert "vulnerabilities" in scan_result
+        
+        # Check vulnerability levels
+        vulns = scan_result["vulnerabilities"]
+        assert "critical" in vulns
+        assert "high" in vulns
+        assert "medium" in vulns
+        assert "low" in vulns
+        
+        # Verify no critical vulnerabilities (deployment gate)
+        assert vulns["critical"]["count"] == 0
+        
+        # Check specific vulnerability types
+        if vulns["high"]["count"] > 0:
+            high_vuln = vulns["high"]["items"][0]
+            assert "cve_id" in high_vuln
+            assert "package" in high_vuln
+            assert "fixed_version" in high_vuln
+            assert "severity" in high_vuln
+        
+        # Test compliance check
+        compliance_result = await deployment_service.check_image_compliance(
+            image="nyelux/backend:latest",
+            policies=["cis-docker-benchmark", "pci-dss"]
+        )
+        
+        assert compliance_result["compliant"] is True
+        assert len(compliance_result["violations"]) == 0
+
+
+class TestKubernetesIntegration:
+    """Test Kubernetes deployment and management"""
+    
+    @pytest.mark.asyncio
+    async def test_kubernetes_deployment_tc_deploy_035(
+        self,
+        deployment_service: DeploymentService
+    ):
+        """TC-DEPLOY-035: Test Kubernetes deployment creation"""
+        # K8s deployment configuration
+        k8s_config = {
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {
+                "name": "nyelux-backend",
+                "namespace": "production",
+                "labels": {
+                    "app": "nyelux",
+                    "component": "backend",
+                    "version": "2.5.0"
+                }
+            },
+            "spec": {
+                "replicas": 3,
+                "selector": {
+                    "matchLabels": {
+                        "app": "nyelux",
+                        "component": "backend"
+                    }
+                },
+                "template": {
+                    "metadata": {
+                        "labels": {
+                            "app": "nyelux",
+                            "component": "backend",
+                            "version": "2.5.0"
+                        }
+                    },
+                    "spec": {
+                        "containers": [{
+                            "name": "nyelux-api",
+                            "image": "nyelux/backend:2.5.0",
+                            "ports": [{"containerPort": 8000}],
+                            "resources": {
+                                "requests": {"memory": "1Gi", "cpu": "500m"},
+                                "limits": {"memory": "2Gi", "cpu": "1000m"}
+                            },
+                            "livenessProbe": {
+                                "httpGet": {"path": "/alive", "port": 8000},
+                                "initialDelaySeconds": 60,
+                                "periodSeconds": 30
+                            },
+                            "readinessProbe": {
+                                "httpGet": {"path": "/ready", "port": 8000},
+                                "initialDelaySeconds": 30,
+                                "periodSeconds": 10
+                            }
+                        }]
+                    }
+                },
+                "strategy": {
+                    "type": "RollingUpdate",
+                    "rollingUpdate": {
+                        "maxSurge": 1,
+                        "maxUnavailable": 0
+                    }
+                }
+            }
+        }
+        
+        # Deploy to Kubernetes
+        k8s_deployment = await deployment_service.deploy_to_kubernetes(
+            config=k8s_config
+        )
+        
+        assert k8s_deployment["status"] == "created"
+        assert k8s_deployment["name"] == "nyelux-backend"
+        
+        # Wait for rollout
+        rollout_status = await deployment_service.wait_for_rollout(
+            deployment_name="nyelux-backend",
+            namespace="production",
+            timeout_seconds=300
+        )
+        
+        assert rollout_status["ready"] is True
+        assert rollout_status["available_replicas"] == 3
+        assert rollout_status["updated_replicas"] == 3
+    
+    @pytest.mark.asyncio
+    async def test_horizontal_pod_autoscaling_tc_deploy_036(
+        self,
+        deployment_service: DeploymentService
+    ):
+        """TC-DEPLOY-036: Test Horizontal Pod Autoscaler configuration"""
+        # HPA configuration
+        hpa_config = {
+            "apiVersion": "autoscaling/v2",
+            "kind": "HorizontalPodAutoscaler",
+            "metadata": {
+                "name": "nyelux-backend-hpa",
+                "namespace": "production"
+            },
+            "spec": {
+                "scaleTargetRef": {
+                    "apiVersion": "apps/v1",
+                    "kind": "Deployment",
+                    "name": "nyelux-backend"
+                },
+                "minReplicas": 3,
+                "maxReplicas": 10,
+                "metrics": [
+                    {
+                        "type": "Resource",
+                        "resource": {
+                            "name": "cpu",
+                            "target": {
+                                "type": "Utilization",
+                                "averageUtilization": 70
+                            }
+                        }
+                    },
+                    {
+                        "type": "Resource",
+                        "resource": {
+                            "name": "memory",
+                            "target": {
+                                "type": "Utilization",
+                                "averageUtilization": 80
+                            }
+                        }
+                    },
+                    {
+                        "type": "Pods",
+                        "pods": {
+                            "metric": {
+                                "name": "http_requests_per_second"
+                            },
+                            "target": {
+                                "type": "AverageValue",
+                                "averageValue": "1000"
+                            }
+                        }
+                    }
+                ],
+                "behavior": {
+                    "scaleDown": {
+                        "stabilizationWindowSeconds": 300,
+                        "policies": [{
+                            "type": "Percent",
+                            "value": 10,
+                            "periodSeconds": 60
+                        }]
+                    },
+                    "scaleUp": {
+                        "stabilizationWindowSeconds": 60,
+                        "policies": [{
+                            "type": "Percent",
+                            "value": 50,
+                            "periodSeconds": 60
+                        }]
+                    }
+                }
+            }
+        }
+        
+        # Create HPA
+        hpa = await deployment_service.create_hpa(config=hpa_config)
+        
+        assert hpa["status"] == "created"
+        
+        # Simulate load increase
+        await deployment_service.simulate_load(
+            target="nyelux-backend",
+            requests_per_second=5000,
+            duration_seconds=120
+        )
+        
+        # Check scaling behavior
+        await asyncio.sleep(90)  # Wait for HPA to react
+        
+        scaling_status = await deployment_service.get_hpa_status(
+            name="nyelux-backend-hpa",
+            namespace="production"
+        )
+        
+        assert scaling_status["current_replicas"] > 3
+        assert scaling_status["current_replicas"] <= 10
+        assert scaling_status["current_cpu_utilization"] > 70
+    
+    @pytest.mark.asyncio
+    async def test_pod_disruption_budget_tc_deploy_037(
+        self,
+        deployment_service: DeploymentService
+    ):
+        """TC-DEPLOY-037: Test Pod Disruption Budget during updates"""
+        # PDB configuration
+        pdb_config = {
+            "apiVersion": "policy/v1",
+            "kind": "PodDisruptionBudget",
+            "metadata": {
+                "name": "nyelux-backend-pdb",
+                "namespace": "production"
+            },
+            "spec": {
+                "minAvailable": 2,
+                "selector": {
+                    "matchLabels": {
+                        "app": "nyelux",
+                        "component": "backend"
+                    }
+                }
+            }
+        }
+        
+        # Create PDB
+        pdb = await deployment_service.create_pdb(config=pdb_config)
+        
+        assert pdb["status"] == "created"
+        
+        # Test disruption during node maintenance
+        maintenance_result = await deployment_service.simulate_node_maintenance(
+            node_name="worker-node-1",
+            drain_timeout_seconds=300
+        )
+        
+        # Verify minimum pods maintained
+        assert maintenance_result["pods_evicted"] > 0
+        assert maintenance_result["minimum_pods_maintained"] is True
+        assert maintenance_result["service_disruption"] is False
+    
+    @pytest.mark.asyncio
+    async def test_configmap_and_secret_management_tc_deploy_038(
+        self,
+        deployment_service: DeploymentService
+    ):
+        """TC-DEPLOY-038: Test ConfigMap and Secret management"""
+        # Create ConfigMap
+        configmap = {
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": "nyelux-config",
+                "namespace": "production"
+            },
+            "data": {
+                "app.properties": """
+                    server.port=8000
+                    cache.ttl=3600
+                    rate.limit=1000
+                """,
+                "features.json": json.dumps({
+                    "new_ui": False,
+                    "ai_chat": True,
+                    "advanced_search": True
+                })
+            }
+        }
+        
+        # Create Secret
+        secret = {
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {
+                "name": "nyelux-secret",
+                "namespace": "production"
+            },
+            "type": "Opaque",
+            "stringData": {
+                "database-url": "postgresql://user:pass@db:5432/nyelux",
+                "api-key": "secret-api-key-value",
+                "jwt-secret": "super-secret-jwt-key"
+            }
+        }
+        
+        # Deploy configurations
+        cm_result = await deployment_service.create_configmap(configmap)
+        secret_result = await deployment_service.create_secret(secret)
+        
+        assert cm_result["status"] == "created"
+        assert secret_result["status"] == "created"
+        
+        # Update deployment to use ConfigMap and Secret
+        update_result = await deployment_service.update_deployment_config(
+            deployment_name="nyelux-backend",
+            namespace="production",
+            config_sources=[
+                {
+                    "type": "configmap",
+                    "name": "nyelux-config",
+                    "mount_path": "/app/config"
+                },
+                {
+                    "type": "secret",
+                    "name": "nyelux-secret",
+                    "env_prefix": "NYELUX_"
+                }
+            ]
+        )
+        
+        assert update_result["status"] == "updated"
+        assert update_result["rolling_update_triggered"] is True
+
+
+class TestMonitoringAndAlerts:
+    """Test monitoring, alerting, and observability systems"""
+    
+    @pytest.mark.asyncio
+    async def test_prometheus_metrics_export_tc_deploy_039(
+        self,
+        monitoring_service: MonitoringService,
+        client: AsyncClient
+    ):
+        """TC-DEPLOY-039: Test Prometheus metrics export"""
+        # Generate some metrics
+        await client.get("/api/v1/devices/search?q=test")
+        await client.post("/api/v1/auth/login", json={
+            "username": "test@example.com",
+            "password": "password"
+        })
+        
+        # Get Prometheus metrics
+        response = await client.get("/metrics")
+        assert response.status_code == 200
+        
+        metrics_text = response.text
+        
+        # Verify standard metrics present
+        expected_metrics = [
+            "http_requests_total",
+            "http_request_duration_seconds",
+            "http_requests_in_progress",
+            "python_gc_objects_collected_total",
+            "python_info",
+            "process_virtual_memory_bytes",
+            "process_resident_memory_bytes",
+            "process_cpu_seconds_total"
+        ]
+        
+        for metric in expected_metrics:
+            assert metric in metrics_text
+        
+        # Verify custom business metrics
+        business_metrics = [
+            "nyelux_active_users",
+            "nyelux_device_searches_total",
+            "nyelux_api_errors_total",
+            "nyelux_chat_sessions_active",
+            "nyelux_document_uploads_total"
+        ]
+        
+        for metric in business_metrics:
+            assert metric in metrics_text
+        
+        # Parse and validate metric format
+        families = list(text_string_to_metric_families(metrics_text))
+        assert len(families) > 20  # Should have many metrics
+        
+        # Check specific metric values
+        for family in families:
+            if family.name == "http_requests_total":
+                for sample in family.samples:
+                    assert sample.value >= 2  # At least our test requests
+    
+    @pytest.mark.asyncio
+    async def test_datadog_integration_tc_deploy_040(
+        self,
+        monitoring_service: MonitoringService
+    ):
+        """TC-DEPLOY-040: Test Datadog monitoring integration"""
+        # Test metric submission
+        with patch('datadog.statsd.gauge') as mock_gauge:
+            await monitoring_service.record_metric(
+                name="custom.metric",
+                value=42.5,
+                tags=["environment:production", "service:api"]
+            )
+            
+            mock_gauge.assert_called_with(
+                "nyelux.custom.metric",
+                42.5,
+                tags=["environment:production", "service:api"]
+            )
+        
+        # Test APM tracing
+        with patch('ddtrace.tracer.trace') as mock_trace:
+            async with monitoring_service.trace_operation("database.query"):
+                # Simulate database operation
+                await asyncio.sleep(0.1)
+            
+            mock_trace.assert_called()
+        
+        # Test custom events
+        with patch('datadog.api.Event.create') as mock_event:
+            await monitoring_service.send_event(
+                title="Deployment Started",
+                text="Deploying version 2.6.0 to production",
+                alert_type="info",
+                tags=["deployment", "production"]
+            )
+            
+            mock_event.assert_called_once()
+    
+    @pytest.mark.asyncio
+    async def test_alert_rule_configuration_tc_deploy_041(
+        self,
+        monitoring_service: MonitoringService,
+        db: AsyncSession
+    ):
+        """TC-DEPLOY-041: Test alert rule configuration and triggering"""
+        # Create alert rules
+        alert_rules = [
+            {
+                "name": "high_error_rate",
+                "metric": "error_rate",
+                "condition": {
+                    "operator": ">",
+                    "threshold": 5.0,
+                    "duration_minutes": 5
+                },
+                "severity": "critical",
+                "channels": ["pagerduty", "slack"],
+                "message": "Error rate exceeds 5% for 5 minutes"
+            },
+            {
+                "name": "slow_response_time",
+                "metric": "response_time_p95",
+                "condition": {
+                    "operator": ">",
+                    "threshold": 1000,
+                    "duration_minutes": 10
+                },
+                "severity": "warning",
+                "channels": ["slack", "email"],
+                "message": "95th percentile response time > 1s"
+            },
+            {
+                "name": "low_disk_space",
+                "metric": "disk_usage_percent",
+                "condition": {
+                    "operator": ">",
+                    "threshold": 90,
+                    "duration_minutes": 1
+                },
+                "severity": "critical",
+                "channels": ["pagerduty"],
+                "message": "Disk usage exceeds 90%"
+            }
+        ]
+        
+        for rule in alert_rules:
+            created_rule = await monitoring_service.create_alert_rule(rule)
+            assert created_rule["id"] is not None
+            assert created_rule["active"] is True
+        
+        # Simulate metric breach
+        for i in range(6):  # 6 minutes of high error rate
+            await monitoring_service.record_metric("error_rate", 7.5)
+            await asyncio.sleep(0.1)  # Simulated time
+        
+        # Check if alert triggered
+        triggered_alerts = await monitoring_service.get_triggered_alerts(
+            time_window_minutes=10
+        )
+        
+        assert len(triggered_alerts) > 0
+        high_error_alert = next(
+            (a for a in triggered_alerts if a["rule_name"] == "high_error_rate"),
+            None
+        )
+        assert high_error_alert is not None
+        assert high_error_alert["severity"] == "critical"
+        
+        # Verify notifications sent
+        notifications = await monitoring_service.get_sent_notifications(
+            alert_id=high_error_alert["id"]
+        )
+        
+        assert len(notifications) == 2  # PagerDuty and Slack
+        assert any(n["channel"] == "pagerduty" for n in notifications)
+        assert any(n["channel"] == "slack" for n in notifications)
+    
+    @pytest.mark.asyncio
+    async def test_sla_monitoring_tc_deploy_042(
+        self,
+        monitoring_service: MonitoringService
+    ):
+        """TC-DEPLOY-042: Test SLA monitoring and reporting"""
+        # Define SLA targets
+        sla_config = {
+            "availability": {
+                "target": 99.9,  # 99.9% uptime
+                "measurement_window": "monthly"
+            },
+            "response_time": {
+                "p50": 100,  # 50th percentile < 100ms
+                "p95": 500,  # 95th percentile < 500ms
+                "p99": 1000  # 99th percentile < 1s
+            },
+            "error_rate": {
+                "target": 0.1  # Less than 0.1%
+            }
+        }
+        
+        # Record metrics for SLA calculation
+        metrics_data = {
+            "uptime_seconds": 2591700,  # 29.99 days
+            "total_seconds": 2592000,   # 30 days
+            "response_times": [50, 75, 90, 100, 120, 150, 200, 450, 600, 950],
+            "total_requests": 1000000,
+            "error_count": 500
+        }
+        
+        # Calculate SLA compliance
+        sla_report = await monitoring_service.calculate_sla_compliance(
+            config=sla_config,
+            metrics=metrics_data
+        )
+        
+        # Check availability SLA
+        assert sla_report["availability"]["actual"] == 99.988  # 29.99/30 days
+        assert sla_report["availability"]["meets_sla"] is True
+        
+        # Check response time SLA
+        assert sla_report["response_time"]["p50"]["actual"] < 100
+        assert sla_report["response_time"]["p95"]["actual"] < 500
+        assert sla_report["response_time"]["p99"]["actual"] < 1000
+        assert sla_report["response_time"]["meets_sla"] is True
+        
+        # Check error rate SLA
+        assert sla_report["error_rate"]["actual"] == 0.05  # 0.05%
+        assert sla_report["error_rate"]["meets_sla"] is True
+        
+        # Overall SLA status
+        assert sla_report["overall_sla_met"] is True
+    
+    @pytest.mark.asyncio
+    async def test_custom_dashboards_tc_deploy_043(
+        self,
+        monitoring_service: MonitoringService
+    ):
+        """TC-DEPLOY-043: Test custom dashboard creation"""
+        # Create custom dashboard
+        dashboard_config = {
+            "name": "Deployment Overview",
+            "refresh_interval": 30,  # seconds
+            "time_range": "last_24h",
+            "panels": [
+                {
+                    "title": "Deployment Status",
+                    "type": "stat",
+                    "queries": [{
+                        "metric": "deployment.status",
+                        "aggregation": "last"
+                    }]
+                },
+                {
+                    "title": "Error Rate",
+                    "type": "graph",
+                    "queries": [{
+                        "metric": "error_rate",
+                        "aggregation": "avg",
+                        "group_by": ["service"]
+                    }]
+                },
+                {
+                    "title": "Response Time Heatmap",
+                    "type": "heatmap",
+                    "queries": [{
+                        "metric": "response_time",
+                        "aggregation": "histogram"
+                    }]
+                },
+                {
+                    "title": "Active Users",
+                    "type": "gauge",
+                    "queries": [{
+                        "metric": "active_users",
+                        "aggregation": "sum"
+                    }],
+                    "thresholds": [
+                        {"value": 1000, "color": "green"},
+                        {"value": 5000, "color": "yellow"},
+                        {"value": 10000, "color": "red"}
+                    ]
+                }
+            ]
+        }
+        
+        dashboard = await monitoring_service.create_dashboard(dashboard_config)
+        
+        assert dashboard["id"] is not None
+        assert len(dashboard["panels"]) == 4
+        
+        # Test dashboard data retrieval
+        dashboard_data = await monitoring_service.get_dashboard_data(
+            dashboard_id=dashboard["id"]
+        )
+        
+        assert len(dashboard_data["panels"]) == 4
+        for panel_data in dashboard_data["panels"]:
+            assert "data" in panel_data
+            assert panel_data["last_updated"] is not None
+
+
+class TestBackupAndRecovery:
+    """Test backup and recovery procedures"""
+    
+    @pytest.mark.asyncio
+    async def test_automated_backup_tc_deploy_044(
+        self,
+        rollback_service: RollbackService,
+        db: AsyncSession
+    ):
+        """TC-DEPLOY-044: Test automated backup procedures"""
+        # Configure backup schedule
+        backup_config = {
+            "schedule": {
+                "full_backup": "0 2 * * *",  # 2 AM daily
+                "incremental_backup": "0 */6 * * *",  # Every 6 hours
+                "transaction_log_backup": "*/15 * * * *"  # Every 15 minutes
+            },
+            "retention": {
+                "full_backup_days": 30,
+                "incremental_backup_days": 7,
+                "transaction_log_hours": 48
+            },
+            "targets": {
+                "database": True,
+                "redis": True,
+                "files": True,
+                "configurations": True
+            },
+            "encryption": {
+                "enabled": True,
+                "algorithm": "AES-256-GCM"
+            }
+        }
+        
+        # Execute full backup
+        backup_result = await rollback_service.execute_backup(
+            backup_type="full",
+            config=backup_config
+        )
+        
+        assert backup_result["status"] == "completed"
+        assert backup_result["backup_id"] is not None
+        assert backup_result["size_gb"] > 0
+        assert backup_result["encrypted"] is True
+        
+        # Verify backup integrity
+        integrity_check = await rollback_service.verify_backup_integrity(
+            backup_id=backup_result["backup_id"]
+        )
+        
+        assert integrity_check["valid"] is True
+        assert integrity_check["checksum_verified"] is True
+        assert integrity_check["all_components_present"] is True
+        
+        # Test backup catalog
+        catalog = await rollback_service.get_backup_catalog(
+            start_date=datetime.utcnow() - timedelta(days=7)
+        )
+        
+        assert len(catalog["backups"]) > 0
+        latest_backup = catalog["backups"][0]
+        assert latest_backup["backup_id"] == backup_result["backup_id"]
+    
+    @pytest.mark.asyncio
+    async def test_point_in_time_recovery_tc_deploy_045(
+        self,
+        rollback_service: RollbackService,
+        db: AsyncSession
+    ):
+        """TC-DEPLOY-045: Test point-in-time recovery"""
+        # Create test data with timestamps
+        test_data = []
+        base_time = datetime.utcnow() - timedelta(hours=24)
+        
+        for i in range(24):  # 24 hours of data
+            timestamp = base_time + timedelta(hours=i)
+            data = {
+                "event": f"test_event_{i}",
+                "timestamp": timestamp,
+                "value": i * 100
+            }
+            test_data.append(data)
+            
+            # Insert into database
+            await db.execute(
+                "INSERT INTO test_events (event, timestamp, value) VALUES (:event, :timestamp, :value)",
+                data
+            )
+        
+        await db.commit()
+        
+        # Choose recovery point (12 hours ago)
+        recovery_point = datetime.utcnow() - timedelta(hours=12)
+        
+        # Execute point-in-time recovery
+        recovery_result = await rollback_service.point_in_time_recovery(
+            target_time=recovery_point,
+            databases=["nyelux_production"],
+            validate_before_restore=True
+        )
+        
+        assert recovery_result["status"] == "completed"
+        assert recovery_result["recovered_to"] == recovery_point
+        assert recovery_result["data_loss_window_seconds"] < 60  # Less than 1 minute
+        
+        # Verify recovered data
+        result = await db.execute(
+            "SELECT COUNT(*) FROM test_events WHERE timestamp <= :recovery_point",
+            {"recovery_point": recovery_point}
+        )
+        count = result.scalar()
+        
+        assert count == 12  # Should have 12 hours of data
+    
+    @pytest.mark.asyncio
+    async def test_disaster_recovery_drill_tc_deploy_046(
+        self,
+        rollback_service: RollbackService,
+        deployment_service: DeploymentService
+    ):
+        """TC-DEPLOY-046: Test disaster recovery drill"""
+        # Configure DR drill
+        dr_config = {
+            "scenario": "complete_datacenter_failure",
+            "target_environment": "dr_site",
+            "recovery_objectives": {
+                "rto_minutes": 240,  # 4 hour Recovery Time Objective
+                "rpo_minutes": 15    # 15 minute Recovery Point Objective
+            },
+            "components_to_recover": [
+                "database",
+                "application_servers",
+                "redis_cache",
+                "file_storage",
+                "load_balancers"
+            ],
+            "validation_steps": [
+                "data_integrity_check",
+                "application_health_check",
+                "user_authentication_test",
+                "api_functionality_test"
+            ]
+        }
+        
+        # Start DR drill
+        drill_start = datetime.utcnow()
+        drill_result = await rollback_service.execute_dr_drill(
+            config=dr_config,
+            dry_run=False  # Actually perform recovery
+        )
+        
+        drill_end = datetime.utcnow()
+        drill_duration = (drill_end - drill_start).total_seconds() / 60
+        
+        # Verify RTO met
+        assert drill_duration < dr_config["recovery_objectives"]["rto_minutes"]
+        
+        # Verify all components recovered
+        assert drill_result["status"] == "completed"
+        assert all(
+            comp["recovered"] is True 
+            for comp in drill_result["components"]
+        )
+        
+        # Verify RPO met
+        data_loss = await rollback_service.calculate_data_loss(
+            recovery_point=drill_result["recovery_point"]
+        )
+        
+        assert data_loss["minutes"] < dr_config["recovery_objectives"]["rpo_minutes"]
+        
+        # Run validation tests
+        validation_results = await rollback_service.run_dr_validation(
+            environment="dr_site",
+            tests=dr_config["validation_steps"]
+        )
+        
+        assert all(test["passed"] is True for test in validation_results)
+        
+        # Generate DR report
+        report = await rollback_service.generate_dr_report(
+            drill_id=drill_result["drill_id"]
+        )
+        
+        assert report["objectives_met"] is True
+        assert report["recommendations"] is not None
+    
+    @pytest.mark.asyncio
+    async def test_cross_region_backup_replication_tc_deploy_047(
+        self,
+        rollback_service: RollbackService
+    ):
+        """TC-DEPLOY-047: Test cross-region backup replication"""
+        # Configure multi-region backup
+        replication_config = {
+            "primary_region": "us-east-1",
+            "replica_regions": ["us-west-2", "eu-west-1", "ap-southeast-1"],
+            "replication_mode": "asynchronous",
+            "retention_policy": {
+                "primary": 30,  # days
+                "replicas": 14  # days
+            },
+            "encryption_in_transit": True
+        }
+        
+        # Create backup in primary region
+        primary_backup = await rollback_service.create_backup(
+            backup_type="full",
+            region=replication_config["primary_region"]
+        )
+        
+        assert primary_backup["status"] == "completed"
+        
+        # Replicate to other regions
+        replication_jobs = []
+        for region in replication_config["replica_regions"]:
+            job = await rollback_service.replicate_backup(
+                backup_id=primary_backup["backup_id"],
+                source_region=replication_config["primary_region"],
+                target_region=region,
+                encryption=replication_config["encryption_in_transit"]
+            )
+            replication_jobs.append(job)
+        
+        # Wait for replications to complete
+        for job in replication_jobs:
+            status = await rollback_service.wait_for_replication(
+                job_id=job["job_id"],
+                timeout_minutes=60
+            )
+            
+            assert status["completed"] is True
+            assert status["verified"] is True
+            assert status["target_region"] in replication_config["replica_regions"]
+        
+        # Verify backups in all regions
+        for region in [replication_config["primary_region"]] + replication_config["replica_regions"]:
+            regional_backup = await rollback_service.get_backup(
+                backup_id=primary_backup["backup_id"],
+                region=region
+            )
+            
+            assert regional_backup is not None
+            assert regional_backup["size_bytes"] == primary_backup["size_bytes"]
+            assert regional_backup["checksum"] == primary_backup["checksum"]
+
+
+class TestSecurityHardening:
+    """Test security hardening for deployments"""
+    
+    @pytest.mark.asyncio
+    async def test_security_scanning_in_pipeline_tc_deploy_048(
+        self,
+        deployment_service: DeploymentService
+    ):
+        """TC-DEPLOY-048: Test security scanning in deployment pipeline"""
+        # Configure security scanning
+        security_config = {
+            "stages": [
+                {
+                    "name": "sast",
+                    "tool": "sonarqube",
+                    "fail_on": ["critical", "high"],
+                    "exclude_patterns": ["test/", "migrations/"]
+                },
+                {
+                    "name": "dependency_check",
+                    "tool": "snyk",
+                    "fail_on": ["critical"],
+                    "auto_fix": True
+                },
+                {
+                    "name": "secrets_scan",
+                    "tool": "trufflehog",
+                    "fail_on": ["any"],
+                    "patterns": ["*.py", "*.yml", "*.json"]
+                },
+                {
+                    "name": "license_check",
+                    "tool": "fossa",
+                    "allowed_licenses": ["MIT", "Apache-2.0", "BSD"],
+                    "fail_on": ["GPL", "AGPL"]
+                }
+            ]
+        }
+        
+        # Run security pipeline
+        scan_results = await deployment_service.run_security_scan(
+            commit_sha="abc123",
+            config=security_config
+        )
+        
+        # Check SAST results
+        sast_results = scan_results["sast"]
+        assert sast_results["status"] == "passed"
+        assert sast_results["vulnerabilities"]["critical"] == 0
+        assert sast_results["vulnerabilities"]["high"] == 0
+        assert sast_results["code_coverage"] > 80
+        
+        # Check dependency scanning
+        dep_results = scan_results["dependency_check"]
+        assert dep_results["status"] == "passed"
+        assert dep_results["vulnerabilities"]["critical"] == 0
+        if dep_results["auto_fixed_count"] > 0:
+            assert dep_results["fix_pr_created"] is True
+        
+        # Check secrets scanning
+        secrets_results = scan_results["secrets_scan"]
+        assert secrets_results["status"] == "passed"
+        assert secrets_results["secrets_found"] == 0
+        
+        # Check license compliance
+        license_results = scan_results["license_check"]
+        assert license_results["status"] == "passed"
+        assert license_results["incompatible_licenses"] == []
+        
+        # Overall gate decision
+        assert scan_results["overall_status"] == "passed"
+        assert scan_results["deployment_allowed"] is True
+    
+    @pytest.mark.asyncio
+    async def test_runtime_security_monitoring_tc_deploy_049(
+        self,
+        monitoring_service: MonitoringService,
+        deployment_service: DeploymentService
+    ):
+        """TC-DEPLOY-049: Test runtime security monitoring"""
+        # Configure runtime security
+        runtime_config = {
+            "falco_rules": [
+                "Unauthorized process execution",
+                "Suspicious network activity",
+                "File integrity monitoring",
+                "Container escape attempts"
+            ],
+            "network_policies": {
+                "default_deny": True,
+                "allowed_egress": [
+                    {"to": "database", "port": 5432},
+                    {"to": "redis", "port": 6379},
+                    {"to": "internet", "ports": [80, 443]}
+                ]
+            },
+            "admission_policies": [
+                "require_security_context",
+                "disallow_privileged",
+                "require_non_root",
+                "require_read_only_root_filesystem"
+            ]
+        }
+        
+        # Deploy with security policies
+        deployment = await deployment_service.deploy_with_security(
+            version="2.7.0",
+            security_config=runtime_config
+        )
+        
+        assert deployment["security_policies_applied"] is True
+        
+        # Simulate security events
+        security_events = [
+            {
+                "type": "unauthorized_exec",
+                "process": "/bin/sh",
+                "container": "nyelux-api",
+                "severity": "high"
+            },
+            {
+                "type": "suspicious_network",
+                "destination": "10.0.0.100:22",
+                "container": "nyelux-api",
+                "severity": "critical"
+            }
+        ]
+        
+        # Process security events
+        for event in security_events:
+            response = await monitoring_service.handle_security_event(event)
+            
+            if event["severity"] == "critical":
+                assert response["action"] == "isolate_container"
+                assert response["alert_sent"] is True
+            elif event["severity"] == "high":
+                assert response["action"] == "log_and_alert"
+        
+        # Check security posture
+        posture = await monitoring_service.get_security_posture()
+        
+        assert posture["compliance_score"] > 90
+        assert posture["vulnerabilities"]["unpatched"] == 0
+        assert posture["misconfigurations"] == []
+    
+    @pytest.mark.asyncio
+    async def test_certificate_management_tc_deploy_050(
+        self,
+        deployment_service: DeploymentService
+    ):
+        """TC-DEPLOY-050: Test SSL certificate management and rotation"""
+        # Certificate configuration
+        cert_config = {
+            "domains": [
+                "api.nyelux.com",
+                "*.nyelux.com",
+                "app.nyelux.com"
+            ],
+            "provider": "letsencrypt",
+            "auto_renewal": True,
+            "renewal_threshold_days": 30,
+            "key_algorithm": "rsa-4096",
+            "dns_challenge": True
+        }
+        
+        # Request new certificate
+        cert_result = await deployment_service.request_certificate(
+            config=cert_config
+        )
+        
+        assert cert_result["status"] == "issued"
+        assert cert_result["valid_days"] == 90
+        assert cert_result["san_count"] == 3
+        
+        # Verify certificate details
+        cert_info = await deployment_service.get_certificate_info(
+            cert_id=cert_result["cert_id"]
+        )
+        
+        assert cert_info["issuer"] == "Let's Encrypt"
+        assert cert_info["key_size"] == 4096
+        assert all(domain in cert_info["domains"] for domain in cert_config["domains"])
+        
+        # Test certificate rotation
+        rotation_result = await deployment_service.rotate_certificate(
+            cert_id=cert_result["cert_id"],
+            reason="scheduled_rotation"
+        )
+        
+        assert rotation_result["status"] == "completed"
+        assert rotation_result["downtime_seconds"] == 0
+        assert rotation_result["old_cert_revoked"] is True
+        
+        # Verify auto-renewal configuration
+        renewal_config = await deployment_service.get_renewal_configuration(
+            cert_id=cert_result["cert_id"]
+        )
+        
+        assert renewal_config["auto_renewal_enabled"] is True
+        assert renewal_config["days_before_expiry"] == 30
+        assert renewal_config["renewal_hook_configured"] is True

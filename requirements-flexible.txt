@@ -1,0 +1,43 @@
+# Nyelux Backend - Core Requirements
+# Let pip resolve compatible versions
+
+# Core Framework
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+python-multipart>=0.0.6
+python-dotenv>=1.0.0
+
+# Database
+sqlalchemy>=2.0.0
+asyncpg>=0.29.0
+alembic>=1.13.0
+psycopg2-binary>=2.9.0
+
+# Authentication
+python-jose[cryptography]>=3.3.0
+passlib[bcrypt]>=1.7.4
+
+# HTTP - Let Supabase determine httpx version
+requests>=2.31.0
+urllib3>=2.1.0
+certifi>=2023.11.0
+
+# Redis
+redis>=5.0.0
+
+# Supabase (FDA Database) - This will install correct httpx version
+supabase>=2.3.0
+
+# OpenAI (AI Chat)
+openai>=1.6.0
+tenacity>=8.2.0
+
+# Email
+sendgrid>=6.11.0
+
+# Essential Utilities
+python-dateutil>=2.8.0
+pytz>=2023.3
+orjson>=3.9.0

@@ -1,0 +1,58 @@
+from sqlalchemy import (
+    Column, Integer, String, Boolean, ForeignKey, Text, DateTime, Index
+)
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import relationship
+
+from src.db.base_class import Base
+
+
+class SavedSearch(Base):
+    """
+    User saved search alerts.
+    Allows users to save searches and optionally receive alerts for new results.
+    """
+    __tablename__ = "saved_searches"
+    
+    # Primary key
+    id = Column(Integer, primary_key=True, index=True)
+    
+    # User association
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    
+    # Search details
+    name = Column(String(255), nullable=False)
+    search_query = Column(Text, nullable=False)
+    filters = Column(JSONB, nullable=True)
+    
+    # Alert settings
+    alert_enabled = Column(Boolean, default=False, nullable=False)
+    alert_frequency = Column(String(20), nullable=True)  # daily, weekly, immediate
+    last_alerted_at = Column(DateTime(timezone=True), nullable=True)
+    
+    # Relationships
+    user = relationship("User", back_populates="saved_searches")
+    
+    # Indexes
+    __table_args__ = (
+        Index('idx_saved_search_user', 'user_id'),
+        Index('idx_saved_search_alert', 'user_id', 'alert_enabled'),
+    )
+    
+    def to_dict(self) -> dict:
+        """Convert to dictionary for API responses"""
+        return {
+            "id": self.id,
+            "user_id": self.user_id,
+            "name": self.name,
+            "search_query": self.search_query,
+            "filters": self.filters or {},
+            "alert_enabled": self.alert_enabled,
+            "alert_frequency": self.alert_frequency,
+            "last_alerted_at": self.last_alerted_at.isoformat() if self.last_alerted_at else None,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+    
+    def __repr__(self):
+        return f"<SavedSearch {self.name} by User {self.user_id}>"

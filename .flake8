@@ -1,0 +1,40 @@
+[flake8]
+# Production-ready flake8 configuration
+max-line-length = 120
+exclude = 
+    .git,
+    __pycache__,
+    venv,
+    .venv,
+    .eggs,
+    *.egg,
+    build,
+    dist,
+    .pytest_cache,
+    .mypy_cache,
+    alembic/versions
+ignore = 
+    # Whitespace before ':'
+    E203,
+    # Line break before binary operator
+    W503,
+    # Module imported but unused (handled by autoflake)
+    F401,
+    # Local variable assigned but never used
+    F841
+per-file-ignores =
+    # Allow unused imports in __init__.py
+    __init__.py: F401
+    # Allow complexity in migration files
+    alembic/versions/*.py: C901
+max-complexity = 10
+# Require docstrings
+docstring-convention = google
+# Enable additional checks
+enable-extensions = 
+    # Naming conventions
+    N801, N802, N803, N806,
+    # Docstrings
+    D100, D101, D102, D103, D104, D105,
+    # Imports
+    I001, I002

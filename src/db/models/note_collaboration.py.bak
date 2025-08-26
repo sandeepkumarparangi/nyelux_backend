@@ -1,0 +1,91 @@
+"""
+Note collaboration models - mentions, activities, and shares.
+REAL implementation for team collaboration features.
+"""
+from sqlalchemy import Column, Integer, ForeignKey, String, Text, DateTime, Boolean
+from sqlalchemy.orm import relationship
+
+from src.db.base_class import Base
+
+
+class NoteMention(Base):
+    """
+    User mentions in notes (@username).
+    Tracks who was mentioned and where for notifications.
+    """
+    __tablename__ = "note_mentions"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    note_id = Column(Integer, ForeignKey("notes.id"), nullable=False, index=True)
+    mentioned_user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    mentioned_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    
+    mention_text = Column(String(255), nullable=False)  # The actual @mention text
+    mention_position = Column(Integer, nullable=False)  # Character position in content
+    
+    # Notification tracking
+    notified = Column(Boolean, default=False, nullable=False)
+    notified_at = Column(DateTime(timezone=True), nullable=True)
+    
+    # Relationships
+    note = relationship("Note", back_populates="mentions")
+    mentioned_user = relationship("User", foreign_keys=[mentioned_user_id])
+    mentioned_by = relationship("User", foreign_keys=[mentioned_by_user_id])
+    
+    def __repr__(self):
+        return f"<NoteMention {self.mention_text} in Note {self.note_id}>"
+
+
+class NoteActivity(Base):
+    """
+    Activity log for notes.
+    Tracks all actions performed on notes for audit trail.
+    """
+    __tablename__ = "note_activities"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    note_id = Column(Integer, ForeignKey("notes.id"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    
+    activity_type = Column(String(50), nullable=False)  # created, edited, shared, archived, etc.
+    activity_details = Column(Text, nullable=True)  # JSON details about the activity
+    
+    # Relationships
+    note = relationship("Note", back_populates="activities")
+    user = relationship("User")
+    
+    def __repr__(self):
+        return f"<NoteActivity {self.activity_type} on Note {self.note_id}>"
+
+
+class NoteShare(Base):
+    """
+    Note sharing records.
+    Tracks who has access to shared notes.
+    """
+    __tablename__ = "note_shares"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    note_id = Column(Integer, ForeignKey("notes.id"), nullable=False, index=True)
+    
+    # Share target
+    share_type = Column(String(20), nullable=False)  # user, team, department, organization
+    shared_with_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    shared_with_team_id = Column(Integer, nullable=True)
+    shared_with_department_id = Column(Integer, ForeignKey("departments.id"), nullable=True)
+    
+    # Share metadata
+    shared_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    permission_level = Column(String(20), default='view', nullable=False)  # view, comment, edit
+    share_message = Column(Text, nullable=True)
+    
+    # Expiration
+    expires_at = Column(DateTime(timezone=True), nullable=True)
+    
+    # Relationships
+    note = relationship("Note", back_populates="shares")
+    shared_with_user = relationship("User", foreign_keys=[shared_with_user_id])
+    shared_by = relationship("User", foreign_keys=[shared_by_user_id])
+    
+    def __repr__(self):
+        return f"<NoteShare Note {self.note_id} to {self.share_type}>"

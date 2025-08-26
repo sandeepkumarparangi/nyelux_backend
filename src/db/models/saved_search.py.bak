@@ -1,0 +1,33 @@
+"""
+Saved Search Model - User saved search alerts
+"""
+from sqlalchemy import Column, Integer, String, Boolean, ForeignKey, Text, DateTime, JSON
+from sqlalchemy.orm import relationship
+from sqlalchemy.sql import func
+
+from src.db.base_class import Base
+
+
+class SavedSearch(Base):
+    """
+    User saved search alerts with notification capabilities.
+    Supports scheduled alerts for new matching devices.
+    """
+    __tablename__ = "saved_searches"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    name = Column(String(255), nullable=False)
+    search_query = Column(Text, nullable=False)
+    filters = Column(JSON, default={})
+    alert_enabled = Column(Boolean, default=False, nullable=False)
+    alert_frequency = Column(String(20), default="daily")  # daily, weekly, monthly
+    last_alerted_at = Column(DateTime(timezone=True))
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+    
+    # Relationships
+    user = relationship("User", back_populates="saved_searches")
+    
+    def __repr__(self):
+        return f"<SavedSearch({self.name}, user={self.user_id})>"

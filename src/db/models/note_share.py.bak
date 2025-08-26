@@ -1,0 +1,43 @@
+"""
+Note sharing model for collaboration.
+REAL implementation for team collaboration features.
+"""
+from sqlalchemy import Column, Integer, ForeignKey, String, Text, DateTime, Boolean
+from sqlalchemy.orm import relationship
+
+from src.db.base_class import Base
+
+
+class NoteShare(Base):
+    """
+    Note sharing records.
+    Tracks who has access to shared notes.
+    """
+    __tablename__ = "note_shares"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    note_id = Column(Integer, ForeignKey("notes.id"), nullable=False, index=True)
+    
+    # Share target
+    share_type = Column(String(20), nullable=False)  # user, team, department, organization
+    shared_with_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    shared_with_team_id = Column(Integer, ForeignKey("teams.id"), nullable=True)
+    shared_with_department_id = Column(Integer, ForeignKey("departments.id"), nullable=True)
+    
+    # Share metadata
+    shared_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    permission_level = Column(String(20), default='view', nullable=False)  # view, comment, edit
+    share_message = Column(Text, nullable=True)
+    
+    # Expiration
+    expires_at = Column(DateTime(timezone=True), nullable=True)
+    
+    # Relationships
+    note = relationship("Note", back_populates="shares")
+    shared_with_user = relationship("User", foreign_keys=[shared_with_user_id])
+    shared_by = relationship("User", foreign_keys=[shared_by_user_id])
+    shared_with_team = relationship("Team", foreign_keys=[shared_with_team_id], back_populates="shared_notes")
+    shared_with_department = relationship("Department", foreign_keys=[shared_with_department_id])
+    
+    def __repr__(self):
+        return f"<NoteShare Note {self.note_id} to {self.share_type}>"

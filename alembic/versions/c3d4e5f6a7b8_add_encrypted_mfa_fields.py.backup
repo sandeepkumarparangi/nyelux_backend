@@ -1,0 +1,40 @@
+"""Add encrypted MFA and email verification fields
+
+Revision ID: add_encrypted_mfa_fields
+Revises: 
+Create Date: 2024-01-01 00:00:00.000000
+
+"""
+from alembic import op
+import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql
+
+# revision identifiers, used by Alembic
+revision = 'c3d4e5f6a7b8'
+down_revision = 'b2c3d4e5f6a7'
+branch_labels = None
+depends_on = None
+
+
+def upgrade() -> None:
+    # Add encrypted MFA fields
+    op.add_column('users', sa.Column('mfa_secret_encrypted', sa.LargeBinary(), nullable=True))
+    op.add_column('users', sa.Column('mfa_backup_codes_hash', sa.Text(), nullable=True))
+    
+    # Add email verification fields
+    op.add_column('users', sa.Column('email_verification_token_hash', sa.String(length=255), nullable=True))
+    op.add_column('users', sa.Column('email_verification_expires', sa.DateTime(timezone=True), nullable=True))
+    
+    # Create indexes
+    op.create_index('idx_users_email_verification_token_hash', 'users', ['email_verification_token_hash'])
+
+
+def downgrade() -> None:
+    # Remove indexes
+    op.drop_index('idx_users_email_verification_token_hash', table_name='users')
+    
+    # Remove columns
+    op.drop_column('users', 'email_verification_expires')
+    op.drop_column('users', 'email_verification_token_hash')
+    op.drop_column('users', 'mfa_backup_codes_hash')
+    op.drop_column('users', 'mfa_secret_encrypted')
